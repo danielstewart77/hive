@@ -217,9 +217,16 @@ window.addEventListener("DOMContentLoaded", async function () {
     async function renderSoul(name) {
         const section = document.getElementById("mind-soul");
         const status = document.getElementById("mind-soul-status");
+        // The write used to address the Mind by `requested`, which is the
+        // UUID the minds list links with — and Mind nodes in the graph are
+        // named (Skippy, Ada), so every save from a normal navigation went
+        // to a node that does not exist. Read and write take the same
+        // identifier now, the one the model form on this page already uses.
+        section.dataset.mindName = name;
         section.hidden = false;
+        const target = section.dataset.mindName;
         try {
-            applySoul(await h.requestJson("/api/minds/" + encodeURIComponent(name) + "/soul"));
+            applySoul(await h.requestJson("/api/minds/" + encodeURIComponent(target) + "/soul"));
             status.textContent = "";
         } catch (error) {
             document.getElementById("mind-soul-form").hidden = true;
@@ -237,7 +244,8 @@ window.addEventListener("DOMContentLoaded", async function () {
         if (!reason) { status.textContent = "Say why this changed before saving."; return; }
         button.disabled = true; status.textContent = "Saving…";
         try {
-            applySoul(await h.requestJson("/api/minds/" + encodeURIComponent(requested) + "/soul", {
+            const target = document.getElementById("mind-soul").dataset.mindName;
+            applySoul(await h.requestJson("/api/minds/" + encodeURIComponent(target) + "/soul", {
                 method: "PUT",
                 headers: {"Content-Type": "application/json"},
                 body: JSON.stringify({soul_values: lines, reason: reason})

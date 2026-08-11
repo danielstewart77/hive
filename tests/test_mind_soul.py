@@ -9,6 +9,8 @@ so it is asserted on the wire rather than trusted.
 
 import asyncio
 import os
+import pathlib
+import re
 import sys
 
 import httpx
@@ -101,15 +103,26 @@ def test_the_console_cannot_write_an_edit_in_as_the_minds_own(monkeypatch):
     something the Mind decided about itself — which is the one lie the column
     exists to prevent, and the reason it is worth having at all.
     """
+    import inspect
+
+    # Asserted on the signature, because that is where the guarantee lives.
+    # The previous version called positionally and passed even after an
+    # `actor` parameter was added — it proved the call it made, not the call
+    # that is possible.
+    parameters = inspect.signature(mind_soul.push_soul).parameters
+    assert "actor" not in parameters, (
+        "push_soul must not take an actor: a caller that could name itself "
+        "'mind' would launder an operator edit into the record as something "
+        "the Mind decided about itself"
+    )
+
     async def scenario():
         client = _Client([_response(200, {"ok": True})])
         monkeypatch.setattr(httpx, "AsyncClient", client)
 
-        # Whatever a caller passes, only the list and the reason travel.
         await mind_soul.push_soul("skippy", ["I am ancient."], "console edit")
 
         _, _, kwargs = client.calls[0]
-        assert set(kwargs["json"]) == {"name", "soul_values", "actor", "reason"}
         assert kwargs["json"]["actor"] == "console"
 
     _run(scenario())
@@ -168,6 +181,10 @@ def test_history_reports_who_changed_what(monkeypatch):
 
         changes = await mind_soul.fetch_history("skippy")
 
+        method, url, kwargs = client.calls[0]
+        assert method == "GET"
+        assert url == "http://lucent:8424/graph/soul/history"
+        assert kwargs["params"]["name"] == "Skippy"
         assert [c["actor"] for c in changes] == ["console", "mind"]
         assert changes[0]["before"] == ["a", "b"]
         assert changes[0]["after"] == ["a"]
@@ -198,3 +215,48 @@ def test_a_refusal_from_lucent_is_surfaced_rather_than_swallowed(monkeypatch):
         assert caught.value.status_code == 403
 
     _run(scenario())
+
+
+def test_a_refusal_lucent_reports_as_ok_false_is_not_read_as_success(monkeypatch):
+    """The only shape lucent can actually produce, and the one uncovered.
+
+    `not_found`, `reason_required`, `invalid_actor`, `conflict` and
+    `shrink_refused` all come back as **HTTP 200** with `ok: false`. A page
+    that reads the status code alone shows the operator a saved soul that
+    lucent declined to write.
+    """
+    async def scenario():
+        client = _Client([_response(200, {
+            "ok": False, "code": "conflict",
+            "detail": "this soul changed since you read it",
+        })])
+        monkeypatch.setattr(httpx, "AsyncClient", client)
+
+        with pytest.raises(HTTPException) as caught:
+            await mind_soul.push_soul("skippy", ["x"], "why")
+
+        assert caught.value.status_code == 400
+        assert "changed since you read it" in caught.value.detail
+
+    _run(scenario())
+
+
+def test_the_page_reads_and_writes_the_same_mind(monkeypatch):
+    """Requirement 16 across the two halves of the page.
+
+    The read used `mind.name` and the write used `requested` — the UUID the
+    minds list links with. Graph Mind nodes are named, so every save from a
+    normal navigation addressed a node that does not exist and reported
+    "Could not save".
+    """
+    page = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "src" / "templates" / "mind_detail.html"
+    ).read_text()
+
+    soul_calls = re.findall(r'encodeURIComponent\(([^)]+)\) \+ "/soul"', page)
+    assert soul_calls, "the page must call the soul route"
+    assert "requested" not in soul_calls, (
+        "the soul route is addressed by Mind name, not by the UUID in the URL"
+    )
+    assert len(set(soul_calls)) == 1, f"read and write disagree: {soul_calls}"
