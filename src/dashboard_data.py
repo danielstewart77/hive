@@ -127,7 +127,11 @@ def merge_hosts(reports: list[dict]) -> list[dict]:
         identity = reading.get("host") or {}
         # A mind that never answered has no host id to give, so it is keyed
         # to itself — one row for that machine, named by the mind on it.
-        key = identity.get("host_id") or f"mind:{report.get('mind')}"
+        # Keyed to the mind when there is no host id to key to. A shared
+        # fallback would merge every machine that failed to answer into one
+        # row, so two boxes asleep at once would show as one and the second
+        # would be invisible.
+        key = identity.get("host_id") or f"mind:{report.get('mind') or id(report)}"
         candidate = {
             "host_id": key,
             "hostname": identity.get("hostname") or report.get("mind") or "",
@@ -186,6 +190,10 @@ def context_reading(context: dict) -> dict:
     is the one wrong answer that looks like good news.
     """
     tokens = context.get("tokens")
+    # `is None`, never a truth test. Zero is a measurement — a conversation
+    # that has genuinely just started — and absence is the lack of one. A
+    # falsy check renders the second as the first, which is the whole
+    # distinction this function exists to keep.
     threshold = context.get("threshold")
     window = context.get("window")
 
@@ -244,19 +252,42 @@ class SharedSnapshot:
         self._lock = asyncio.Lock()
         self._value: Optional[dict] = None
         self._fetched_at: float = 0.0
+        self._fetched: bool = False
+        self._error: Optional[str] = None
+        self._errored_at: float = 0.0
 
     def _fresh(self) -> bool:
-        return self._value is not None and (self._clock() - self._fetched_at) < self._ttl
+        """Whether the window is still open — after a success or a failure.
+
+        `_fetched_at` is stamped on both, so a run of failures is throttled
+        at the same rate as a run of successes rather than turning every
+        poll into an upstream call.
+        """
+        # An explicit flag rather than a zero sentinel on `_fetched_at`: a
+        # clock that legitimately reads 0.0 would otherwise make the first
+        # reading look like no reading, and every caller would refetch.
+        if not self._fetched:
+            return False
+        return (self._clock() - self._fetched_at) < self._ttl
+
+    def _last(self) -> dict:
+        if self._value is not None:
+            stale = dict(self._value)
+            if self._error:
+                stale["stale"] = True
+                stale["error"] = self._error
+            return stale
+        return {"observed_at": self._fetched_at, "stale": True, "error": self._error}
 
     async def get(self) -> dict:
         if self._fresh():
-            return self._value  # type: ignore[return-value]
+            return self._last()
         async with self._lock:
             # Checked again inside the lock: everyone who queued behind the
             # one in-flight fetch is now holding a fresh value, and running
             # their own would be the stampede the lock exists to prevent.
             if self._fresh():
-                return self._value  # type: ignore[return-value]
+                return self._last()
             now = self._clock()
             try:
                 value = dict(await self._fetch())
@@ -264,15 +295,31 @@ class SharedSnapshot:
                 value["stale"] = False
                 self._value = value
                 self._fetched_at = now
+                self._fetched = True
+                self._error = None
                 return value
             except Exception as exc:  # noqa: BLE001 — a reading, never a fault
+                # A failure holds the window open too. Only marking success
+                # means a proxy answering 401, or an unset key raising every
+                # time, leaves `_fresh()` false forever — and then every poll
+                # from every tab goes upstream. The failing case is precisely
+                # the one where hammering is worst, so it is rate-limited on
+                # the same clock as the succeeding one.
+                self._fetched_at = now
+                self._fetched = True
+                self._error = str(exc)
+                self._errored_at = now
                 if self._value is not None:
                     stale = dict(self._value)
                     stale["stale"] = True
                     stale["error"] = str(exc)
                     return stale
+                self._value = None
                 return {"observed_at": now, "stale": True, "error": str(exc)}
 
     def invalidate(self) -> None:
         self._value = None
         self._fetched_at = 0.0
+        self._fetched = False
+        self._error = None
+        self._errored_at = 0.0

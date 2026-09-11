@@ -715,11 +715,19 @@ async def _probe_mind_host(mind: dict) -> dict:
     if not gateway:
         return {"mind": name, "mind_id": mind.get("id"), "status": "unconfigured",
                 "reading": None, "error": "no gateway URL in the registry"}
+    # Outside the try, and deliberately. `admin_headers()` raises when the
+    # console has no admin token, and inside the try that exception would be
+    # caught by the unreachable arm — naming every machine in the hive as
+    # unreachable because of one unset variable on this box, which is the
+    # exact conflation `host_status_for` exists to prevent.
+    try:
+        headers = mind_runtime.admin_headers()
+    except HTTPException as exc:
+        return {"mind": name, "mind_id": mind.get("id"), "status": "unconfigured",
+                "reading": None, "error": str(exc.detail)}
     try:
         async with httpx.AsyncClient(timeout=dashboard_data.HOST_PROBE_TIMEOUT) as client:
-            response = await client.get(
-                f"{gateway}/host", headers=mind_runtime.admin_headers()
-            )
+            response = await client.get(f"{gateway}/host", headers=headers)
     except Exception as exc:  # noqa: BLE001 — unreachable is a state
         return {"mind": name, "mind_id": mind.get("id"), "status": "unreachable",
                 "reading": None, "error": str(exc)}
@@ -745,8 +753,12 @@ async def _fetch_hosts() -> dict:
     settled = [
         report
         if isinstance(report, dict)
-        else {"mind": "", "status": "unreachable", "reading": None, "error": str(report)}
-        for report in reports
+        # Named, not blanked: a nameless failure row merges with every other
+        # nameless one, and the second dead machine disappears behind the
+        # first.
+        else {"mind": mind.get("name") or "", "mind_id": mind.get("id"),
+              "status": "unreachable", "reading": None, "error": str(report)}
+        for mind, report in zip(minds, reports)
     ]
     return {"hosts": dashboard_data.merge_hosts(settled), "reports": settled}
 
@@ -792,8 +804,20 @@ async def api_dashboard(user: dict = Depends(require_auth)):
             context.get("window"), dashboard_data.window_for(session.get("model"), windows)
         )
         session["context"] = dashboard_data.context_reading(context)
+    # Requirement 5: a mind that is connected and silent is listed, not
+    # omitted. Without it the panel cannot distinguish a quiet hive from a
+    # hive whose minds have all gone.
+    registry = await _broker_minds_safe()
+    producing = {row.get("mind_id") for row in sessions}
+    idle = [
+        {"mind_id": mind.get("id"), "name": mind.get("name"),
+         "model": mind.get("model"), "last_seen": mind.get("last_seen")}
+        for mind in registry
+        if mind.get("id") not in producing
+    ]
     return {
         "columns": dashboard_data.split_columns(sessions),
+        "idle_minds": idle,
         "hosts": hosts if isinstance(hosts, dict) else {"hosts": [], "stale": True,
                                                         "error": str(hosts)},
         "providers": providers if isinstance(providers, dict) else {

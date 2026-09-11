@@ -24,6 +24,7 @@
   const idleEl = document.getElementById("dash-idle");
   const errorEl = document.getElementById("dash-error");
   const observedEl = document.getElementById("dash-observed");
+  const idleMindsEl = document.getElementById("dash-idle-minds");
 
   /** Per session: the last sequence rendered, so each poll asks for the rest. */
   const cursors = new Map();
@@ -138,6 +139,7 @@
     const waiting = payload.columns.waiting || [];
 
     idleEl.hidden = shown.length > 0;
+    renderIdle(payload.idle_minds || []);
     waitingEl.textContent = waiting.length
       ? `${waiting.length} more generating, waiting for a column: ${waiting
           .map((row) => row.mind_id || row.session_id)
@@ -147,7 +149,10 @@
     const wanted = new Set(shown.map((row) => row.session_id));
     Array.from(columnsEl.children).forEach((child) => {
       if (!wanted.has(child.dataset.session)) {
-        cursors.delete(child.dataset.session);
+        // The cursor is kept. A chat conversation stops generating between
+        // turns, so its column comes and goes every turn — dropping the
+        // cursor makes the next one ask from zero and re-render the whole
+        // retained buffer as if the mind had said it all again.
         child.remove();
       }
     });
@@ -166,6 +171,15 @@
         context.replaceWith(contextBlock(session.context || {}));
       }
     });
+  }
+
+  function renderIdle(minds) {
+    // Requirement 5. Without this a quiet hive and a hive whose minds have
+    // all gone render identically, and the page cannot tell you which.
+    if (!idleMindsEl) return;
+    idleMindsEl.textContent = minds.length
+      ? `Connected and idle: ${minds.map((m) => m.name || m.mind_id).join(", ")}`
+      : "";
   }
 
   function renderProviders(payload) {
@@ -267,6 +281,17 @@
   function renderHosts(payload) {
     hostsEl.replaceChildren();
     const rows = (payload && payload.hosts) || [];
+    if (payload && payload.stale) {
+      // Requirement 27. The numbers below are the last ones that arrived,
+      // and a refresh has failed since. Leaving them unlabelled is how a
+      // page lies quietly all morning.
+      const note = document.createElement("p");
+      note.className = "dash-empty is-error";
+      note.textContent = `Machine figures are not refreshing${
+        payload.error ? `: ${payload.error}` : ""
+      } — showing the last reading.`;
+      hostsEl.appendChild(note);
+    }
     if (!rows.length) {
       const note = document.createElement("p");
       note.className = "dash-empty";
@@ -305,6 +330,12 @@
 
       card.appendChild(gpuLine(host.gpu));
       card.appendChild(figureLine("Memory", host.memory));
+      if (host.observed_at) {
+        const when = document.createElement("div");
+        when.className = "metric-detail";
+        when.textContent = `read ${ago(Date.now() / 1000 - host.observed_at)}`;
+        card.appendChild(when);
+      }
       card.appendChild(
         figureLine(
           "Disk",
@@ -318,12 +349,28 @@
     });
   }
 
+  let snapshotInFlight = false;
+  let textInFlight = false;
+
   async function pollSnapshot() {
+    // A slow poll must not be joined by the next one: two in flight both
+    // render, and on the text path both read the same cursor and append the
+    // same blocks, which reads as the model repeating itself.
+    if (snapshotInFlight) return;
+    snapshotInFlight = true;
     try {
       const response = await fetch("/api/dashboard", { credentials: "same-origin" });
       if (!response.ok) throw new Error(`dashboard responded ${response.status}`);
       const payload = await response.json();
-      errorEl.hidden = true;
+      // A 200 whose sessions half failed is the dangerous case: the page
+      // would render "nothing is producing", which is what a quiet hive
+      // looks like. Say which it is.
+      if (payload.sessions_error) {
+        errorEl.hidden = false;
+        errorEl.textContent = `Conversations unavailable: ${payload.sessions_error}`;
+      } else {
+        errorEl.hidden = true;
+      }
       renderColumns(payload);
       renderProviders(payload.providers);
       renderHosts(payload.hosts);
@@ -335,10 +382,22 @@
       errorEl.hidden = false;
       errorEl.textContent = `Dashboard not refreshing: ${err.message}`;
       observedEl.textContent = "stale";
+    } finally {
+      snapshotInFlight = false;
     }
   }
 
   async function pollText() {
+    if (textInFlight) return;
+    textInFlight = true;
+    try {
+      await readAllStreams();
+    } finally {
+      textInFlight = false;
+    }
+  }
+
+  async function readAllStreams() {
     const streams = Array.from(columnsEl.querySelectorAll("[data-stream]"));
     await Promise.all(
       streams.map(async (stream) => {

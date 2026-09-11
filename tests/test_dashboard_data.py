@@ -433,3 +433,113 @@ class TestWindowLookup:
 
     def test_the_catalog_fills_in_when_the_mind_reported_nothing(self):
         assert dd.resolve_window(reported=None, catalog_window=1_000_000) == 1_000_000
+
+
+class TestZeroIsAMeasurement:
+    def test_a_conversation_genuinely_at_zero_reports_zero(self):
+        """A conversation that has just started really is at zero, and that
+        is a reading. Only absence is unknown — a falsy check collapses the
+        two and the panel can no longer say which it is looking at."""
+        reading = dd.context_reading({"tokens": 0, "threshold": 300_000})
+
+        assert reading["status"] == "reporting"
+        assert reading["fraction_of_threshold"] == 0.0
+
+
+class TestEveryFailedMachineKeepsItsOwnRow:
+    def test_two_unreachable_machines_are_two_rows(self):
+        """Two boxes asleep at once must not merge. A shared fallback key
+        hides the second one behind the first, and the machine nobody can
+        see is the machine nobody fixes."""
+        reports = [
+            {"mind": "zack", "status": "unreachable", "reading": None},
+            {"mind": "arnold", "status": "unreachable", "reading": None},
+        ]
+
+        assert len(dd.merge_hosts(reports)) == 2
+
+
+class TestAFailingUpstreamIsThrottledToo:
+    def test_repeated_failures_inside_the_window_query_once(self):
+        """The failing case is the one where hammering hurts most — an
+        erroring proxy polled by every tab every five seconds. Stamping the
+        window only on success turns that into an unbounded retry loop."""
+        clock = _Clock()
+        calls = []
+
+        async def fetch():
+            calls.append(clock())
+            raise RuntimeError("proxy down")
+
+        snapshot = dd.SharedSnapshot(fetch, ttl=60.0, clock=clock)
+
+        async def scenario():
+            await snapshot.get()
+            clock.now = 30.0
+            await snapshot.get()
+
+        asyncio.run(scenario())
+        assert len(calls) == 1
+
+    def test_a_failure_past_the_window_tries_again(self):
+        clock = _Clock()
+        calls = []
+
+        async def fetch():
+            calls.append(clock())
+            raise RuntimeError("proxy down")
+
+        snapshot = dd.SharedSnapshot(fetch, ttl=60.0, clock=clock)
+
+        async def scenario():
+            await snapshot.get()
+            clock.now = 61.0
+            await snapshot.get()
+
+        asyncio.run(scenario())
+        assert len(calls) == 2
+
+    def test_a_recovery_clears_the_error_rather_than_carrying_it(self):
+        clock = _Clock()
+        state = {"fail": True}
+
+        async def fetch():
+            if state["fail"]:
+                raise RuntimeError("proxy down")
+            return {"value": 7}
+
+        snapshot = dd.SharedSnapshot(fetch, ttl=5.0, clock=clock)
+
+        async def scenario():
+            await snapshot.get()
+            state["fail"] = False
+            clock.now = 6.0
+            return await snapshot.get()
+
+        result = asyncio.run(scenario())
+        assert result["value"] == 7
+        assert result["stale"] is False
+        assert result.get("error") is None
+
+    def test_a_cached_failure_still_reports_the_last_good_reading(self):
+        clock = _Clock()
+        state = {"fail": False}
+
+        async def fetch():
+            if state["fail"]:
+                raise RuntimeError("proxy down")
+            return {"value": 1}
+
+        snapshot = dd.SharedSnapshot(fetch, ttl=5.0, clock=clock)
+
+        async def scenario():
+            await snapshot.get()
+            state["fail"] = True
+            clock.now = 6.0
+            await snapshot.get()
+            clock.now = 8.0
+            return await snapshot.get()
+
+        result = asyncio.run(scenario())
+        assert result["value"] == 1
+        assert result["stale"] is True

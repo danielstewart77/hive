@@ -264,3 +264,136 @@ def test_the_text_route_relays_the_sequenced_blocks(tmp_path, monkeypatch, wired
 
     assert body["blocks"][0]["seq"] == 4
     assert relay.await_args.args[1] == {"session_id": "s1", "since": 3}
+
+
+# --- the probe itself, not just the pure function it calls ------------------
+
+
+class _Response:
+    def __init__(self, status_code, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+class _Client:
+    """An httpx.AsyncClient stand-in that answers one way."""
+
+    def __init__(self, result):
+        self._result = result
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, *args, **kwargs):
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
+
+
+def _probe(monkeypatch, result, *, token="admin-token"):
+    if token:
+        monkeypatch.setenv("COMMS_ADMIN_BEARER_TOKEN", token)
+    else:
+        monkeypatch.delenv("COMMS_ADMIN_BEARER_TOKEN", raising=False)
+    monkeypatch.setattr(main_mod.httpx, "AsyncClient", lambda **kw: _Client(result))
+    import asyncio
+
+    return asyncio.run(
+        main_mod._probe_mind_host({"name": "skippy", "id": "m1",
+                                   "gateway_url": "http://skippy:8420"})
+    )
+
+
+def test_a_mind_that_refuses_the_credential_is_not_called_unreachable(monkeypatch):
+    """The only production caller of `host_status_for`. Proving the pure
+    function keeps 401 and 'down' apart says nothing about the route that
+    could still fold them — and folding them sends somebody to reboot a
+    healthy box over a token."""
+    report = _probe(monkeypatch, _Response(401, text="unauthorized"))
+
+    assert report["status"] == "refused"
+
+
+def test_a_mind_without_the_route_is_reported_as_unsupported(monkeypatch):
+    report = _probe(monkeypatch, _Response(404, text="Not Found"))
+
+    assert report["status"] == "unsupported"
+
+
+def test_a_mind_that_does_not_answer_is_unreachable(monkeypatch):
+    report = _probe(monkeypatch, OSError("connection refused"))
+
+    assert report["status"] == "unreachable"
+    assert report["reading"] is None
+
+
+def test_a_reporting_mind_carries_its_reading_through(monkeypatch):
+    report = _probe(monkeypatch, _Response(200, {"host": {"host_id": "boot-1"}}))
+
+    assert report["status"] == "reporting"
+    assert report["reading"]["host"]["host_id"] == "boot-1"
+
+
+def test_an_unset_console_token_does_not_condemn_every_machine(monkeypatch):
+    """`admin_headers()` raises when the console has no admin token. Called
+    inside the request's try block that exception is caught by the
+    unreachable arm, and one unset variable on this box names every machine
+    in the hive as down."""
+    report = _probe(monkeypatch, _Response(200, {"host": {}}), token="")
+
+    assert report["status"] == "unconfigured"
+
+
+def test_a_mind_with_no_gateway_url_is_not_called_unreachable(monkeypatch):
+    import asyncio
+
+    monkeypatch.setenv("COMMS_ADMIN_BEARER_TOKEN", "admin-token")
+    report = asyncio.run(
+        main_mod._probe_mind_host({"name": "ghost", "id": "m2", "gateway_url": ""})
+    )
+
+    assert report["status"] == "unconfigured"
+
+
+# --- Requirement 5: idle minds are listed -----------------------------------
+
+
+def test_a_connected_mind_that_is_not_producing_is_listed_as_idle(
+    tmp_path, monkeypatch, wired
+):
+    """Otherwise a quiet hive and a hive whose minds have all gone render
+    identically — an empty page either way."""
+    monkeypatch.setattr(
+        main_mod,
+        "_broker_minds_safe",
+        AsyncMock(return_value=[
+            {"id": "skippy", "name": "skippy", "model": "claude-opus-5"},
+            {"id": "mordecai", "name": "mordecai", "model": "gpt-5.6"},
+        ]),
+    )
+    client = _authed_client(tmp_path, monkeypatch)
+
+    body = client.get("/api/dashboard").json()
+
+    assert [row["name"] for row in body["idle_minds"]] == ["mordecai"]
+
+
+def test_a_producing_mind_is_not_also_listed_as_idle(tmp_path, monkeypatch, wired):
+    monkeypatch.setattr(
+        main_mod,
+        "_broker_minds_safe",
+        AsyncMock(return_value=[{"id": "skippy", "name": "skippy"}]),
+    )
+    client = _authed_client(tmp_path, monkeypatch)
+
+    body = client.get("/api/dashboard").json()
+
+    assert body["idle_minds"] == []
+    assert body["columns"]["shown"][0]["mind_id"] == "skippy"
