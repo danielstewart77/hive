@@ -43,13 +43,6 @@ def gateway_base_url() -> str:
     return os.getenv("GATEWAY_API_URL") or "http://hive-comms:8424"
 
 
-def _admin_headers() -> dict[str, str]:
-    token = os.getenv("COMMS_ADMIN_BEARER_TOKEN", "")
-    if not token:
-        raise RuntimeError("COMMS_ADMIN_BEARER_TOKEN is not configured")
-    return {"Authorization": f"Bearer {token}"}
-
-
 def _service_headers() -> dict[str, str]:
     token = os.getenv("COMMS_BEARER_TOKEN", "")
     if not token:
@@ -74,11 +67,39 @@ def compose_message(record: dict[str, Any], page: str, kind: str) -> str:
         f"Design session: {record['title']}",
     ]
     if kind == "build":
+        # Build carries the whole agreed specification, not the flagged rows.
+        # It is the last message of the design and the first of the work: a
+        # go signal arriving with no requirements, no tests and no call graph
+        # asks a mind to build from memory.
         lines.append(
             "Daniel pressed Build. The three pages are agreed — write the code."
         )
-    else:
-        lines.append("Daniel submitted feedback on the design page.")
+        for whole_page in design_data.PAGES:
+            lines.append("")
+            lines.append(f"## {whole_page}")
+            for position, item in enumerate(
+                design_data.ordered_items(record, whole_page), start=1
+            ):
+                label = item.get("text") or item.get("sentence") or item.get("name") or ""
+                lines.append(f"{position}. {label}")
+                symbol = item.get("symbol") or {}
+                if symbol.get("name"):
+                    lines.append(
+                        f"   function: {symbol['name']} ({symbol.get('path') or 'planned'})"
+                    )
+                for case in item.get("cases") or []:
+                    lines.append(
+                        f"   {case.get('outcome', '')}: {case.get('input', '')}"
+                        f" → {case.get('expected', '')}"
+                    )
+                if item.get("calls"):
+                    lines.append("   calls: " + ", ".join(item["calls"]))
+                if item.get("called_by"):
+                    lines.append("   called by: " + ", ".join(item["called_by"]))
+        lines.append("</design-session>")
+        return "\n".join(lines)
+
+    lines.append("Daniel submitted feedback on the design page.")
     lines.append("")
 
     for position, item in enumerate(design_data.ordered_items(record, page), start=1):
@@ -173,7 +194,23 @@ async def deliver_notice(notice_id: int) -> bool:
         log.exception("design notice %s could not be delivered", notice_id)
         design_data.release_notice(notice_id)
         return False
-    design_data.mark_delivered(notice_id)
+    except BaseException:
+        # BaseException, not Exception. This runs detached, so a console
+        # shutting down cancels it inside `send_turn`; a CancelledError that
+        # skipped the release would leave the notice claimed forever, and
+        # `deliver_pending` steps over claimed notices — so that submission
+        # would never be delivered by any later path.
+        log.exception("design notice %s could not be delivered", notice_id)
+        design_data.release_notice(notice_id)
+        raise
+    try:
+        design_data.mark_delivered(notice_id)
+    except design_data.DesignNotFound:
+        # The design session was deleted while the turn was in flight. The
+        # message has already reached the mind; there is nothing left to mark
+        # and nothing to retry, and raising here would abort the rest of the
+        # queue.
+        log.info("design notice %s vanished before it could be acknowledged", notice_id)
     return True
 
 
@@ -188,6 +225,11 @@ async def deliver_pending() -> int:
     for notice in design_data.pending_notices():
         if notice.get("claimed_at"):
             continue
-        if await deliver_notice(notice["id"]):
-            sent += 1
+        try:
+            if await deliver_notice(notice["id"]):
+                sent += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — one bad notice must not strand the queue
+            log.exception("design notice %s aborted the queue", notice["id"])
     return sent

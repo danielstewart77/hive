@@ -39,10 +39,22 @@ def _detail(response: httpx.Response) -> str:
 
 
 def _unwrap(response: httpx.Response) -> dict:
-    # A 404 here means the Mind predates this API — Starlette answers 404 for
-    # a path matching no route. A function that is merely absent comes back
-    # 200 with `resolved` false, precisely so the two cannot be confused.
-    if response.status_code == 404 and "no route" not in _detail(response).lower():
+    # Starlette answers a bare `{"detail": "Not Found"}` for a path matching
+    # no route at all, which on this route means the Mind predates the API.
+    # The Mind's own refusals — an undeclared repository, a missing file —
+    # always carry an `error` key. A function that is merely absent is not
+    # here at all: it comes back 200 with `resolved` false, precisely so the
+    # three cannot be confused.
+    if response.status_code == 404:
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if not (isinstance(body, dict) and body.get("error")):
+            raise HTTPException(
+                status_code=501,
+                detail="This Mind is running a version without the /symbols API",
+            )
         raise HTTPException(status_code=404, detail=_detail(response))
     if response.status_code >= 400:
         raise HTTPException(status_code=response.status_code, detail=_detail(response))

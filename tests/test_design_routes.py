@@ -223,3 +223,100 @@ def test_the_detail_page_404s_for_a_design_session_that_does_not_exist(daniel):
 
 def test_the_design_pages_require_a_login(anon):
     assert anon.get("/design", follow_redirects=False).status_code in (303, 401)
+
+
+def test_the_symbol_route_refuses_to_guess_which_repository(mind):
+    response = mind.get(
+        f"{main_mod.DESIGN_PREFIX}/symbols",
+        params={"mind": "skippy", "path": "src/design_data.py", "name": "publish_page"},
+    )
+
+    assert response.status_code == 400
+    assert "repository" in response.json()["detail"].lower()
+
+
+def test_the_symbol_route_takes_the_repository_from_a_single_target_session(mind):
+    created = mind.post(
+        f"{main_mod.DESIGN_PREFIX}/sessions",
+        json={"title": "Design", "repos": ["/only/one"]},
+    ).json()
+
+    response = mind.get(
+        f"{main_mod.DESIGN_PREFIX}/symbols",
+        params={
+            "mind": "skippy",
+            "path": "src/design_data.py",
+            "name": "publish_page",
+            "design_id": created["id"],
+        },
+    )
+
+    # It got past the "name the repository" refusal and on to reaching a Mind
+    # that is not there in this test.
+    assert response.status_code != 400
+
+
+def test_a_mind_with_no_symbols_route_is_reported_as_out_of_date(tmp_path, monkeypatch):
+    """Starlette answers a bare 404 for a path matching no route. Passed
+    through as a 404 that reads as 'no such function', it would send Daniel
+    hunting a typo instead of redeploying the mind."""
+    import httpx
+
+    import mind_symbols
+
+    monkeypatch.setenv("COMMS_ADMIN_BEARER_TOKEN", "admin-token")
+
+    async def route_missing(url, headers=None, params=None):
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None, params=None):
+            return await route_missing(url, headers, params)
+
+    monkeypatch.setattr(mind_symbols.httpx, "AsyncClient", lambda **kw: _Client())
+
+    import asyncio
+
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as refusal:
+        asyncio.run(mind_symbols.resolve("http://mind:8421", "/repo", "x.py", "thing"))
+
+    assert refusal.value.status_code == 501
+
+
+def test_a_mind_refusing_a_repository_is_passed_through_as_a_404(monkeypatch):
+    import asyncio
+
+    import httpx
+    from fastapi import HTTPException
+
+    import mind_symbols
+
+    monkeypatch.setenv("COMMS_ADMIN_BEARER_TOKEN", "admin-token")
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None, params=None):
+            return httpx.Response(
+                404, json={"error": "Repository is not one this mind will read"}
+            )
+
+    monkeypatch.setattr(mind_symbols.httpx, "AsyncClient", lambda **kw: _Client())
+
+    with pytest.raises(HTTPException) as refusal:
+        asyncio.run(mind_symbols.resolve("http://mind:8421", "/repo", "x.py", "thing"))
+
+    assert refusal.value.status_code == 404
+    assert "will read" in refusal.value.detail

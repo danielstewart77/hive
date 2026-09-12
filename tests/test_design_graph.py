@@ -163,3 +163,26 @@ def test_each_row_carries_its_file_parameters_and_arguments():
     assert handler["args"] == "store(design_id)"
     assert handler["calls"] == ["store"]
     assert handler["called_by"] == ["route"]
+
+
+def test_a_callee_with_no_node_of_its_own_is_still_shown():
+    """The ordinary case: a mind names the helper its leaf calls without
+    bothering to describe it. Indexing that name would crash the trim."""
+    graph = [_node("handler", ["a_helper_nobody_described"], changed=True)]
+
+    rows = design_graph.trim_call_graph(graph)
+
+    assert [row["name"] for row in rows] == ["handler", "a_helper_nobody_described"]
+
+
+def test_a_cyclic_change_set_still_shows_its_neighbours():
+    graph = [
+        _node("route", ["a"]),
+        _node("a", ["b"], changed=True),
+        _node("b", ["a", "sink"], changed=True),
+        _node("sink"),
+    ]
+
+    rows = design_graph.trim_call_graph(graph)
+
+    assert [row["name"] for row in rows] == ["route", "a", "b", "sink"]

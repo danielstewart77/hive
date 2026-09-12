@@ -80,7 +80,11 @@ function designDetail() {
     const designId = root.dataset.designId;
     let page = "requirements";
     let record = null;
-    let dirty = false;
+    /* Everything typed and not yet submitted, keyed by page and item, kept
+       across redraws and across tab switches. The poll rebuilds the DOM from
+       the server record every few seconds; without this, a question longer
+       than one typing burst cannot be finished, let alone sent. */
+    const pending = { requirements: {}, tests: {}, functions: {} };
 
     function itemLabel(item) {
         if (page === "requirements") { return item.text || ""; }
@@ -124,6 +128,26 @@ function designDetail() {
         return bits.length ? '<p class="design-graph">' + bits.join(" · ") + "</p>" : "";
     }
 
+    function stash() {
+        const host = document.getElementById("design-items");
+        if (!host) { return; }
+        host.querySelectorAll("[data-key]").forEach(function (field) {
+            pending[page][field.dataset.key] = pending[page][field.dataset.key] || {};
+            pending[page][field.dataset.key].text = field.value;
+        });
+        host.querySelectorAll("[data-feedback]").forEach(function (field) {
+            const key = field.dataset.feedback;
+            pending[page][key] = pending[page][key] || {};
+            pending[page][key].feedback = field.value;
+        });
+    }
+
+    function held(key, field, fallback) {
+        const kept = pending[page][key];
+        if (kept && kept[field] !== undefined) { return kept[field]; }
+        return fallback;
+    }
+
     function drawItems() {
         const host = document.getElementById("design-items");
         const items = record.pages[page];
@@ -141,7 +165,7 @@ function designDetail() {
                 (item.role === "context" ? '<span class="design-tag">unchanged</span>' : "") + "</div>" +
                 (editable
                     ? '<textarea class="design-text" data-key="' + designEscape(item.key) + '" rows="3">' +
-                      designEscape(itemLabel(item)) + "</textarea>"
+                      designEscape(held(item.key, "text", itemLabel(item))) + "</textarea>"
                     : "<p class=\"design-name\">" + designEscape(itemLabel(item)) + "</p>") +
                 symbolBlock(item) + casesBlock(item) + graphBlock(item) +
                 (item.question_answered
@@ -149,26 +173,28 @@ function designDetail() {
                     : "") +
                 (item.answer ? '<p class="design-answer">' + designEscape(item.answer) + "</p>" : "") +
                 '<textarea class="design-feedback" data-feedback="' + designEscape(item.key) +
-                '" rows="2" placeholder="question or correction">' + designEscape(item.feedback || "") + "</textarea>";
+                '" rows="2" placeholder="question or correction">' +
+                designEscape(held(item.key, "feedback", item.feedback || "")) + "</textarea>";
             host.appendChild(block);
         });
         host.querySelectorAll("textarea").forEach(function (field) {
-            field.addEventListener("input", function () { dirty = true; });
+            field.addEventListener("input", stash);
         });
     }
 
     function collect() {
-        const host = document.getElementById("design-items");
+        /* Read from the stash, not from the DOM: feedback typed on page one
+           and submitted from page two is only in the stash, and the DOM only
+           ever holds the page currently rendered. */
+        stash();
         const items = {};
-        host.querySelectorAll("[data-key]").forEach(function (field) {
-            const key = field.dataset.key;
-            items[key] = items[key] || {};
-            items[key][page === "tests" ? "sentence" : "text"] = field.value;
-        });
-        host.querySelectorAll("[data-feedback]").forEach(function (field) {
-            const key = field.dataset.feedback;
-            items[key] = items[key] || {};
-            items[key].feedback = field.value;
+        Object.keys(pending[page]).forEach(function (key) {
+            const kept = pending[page][key];
+            items[key] = {};
+            if (kept.text !== undefined) {
+                items[key][page === "tests" ? "sentence" : "text"] = kept.text;
+            }
+            if (kept.feedback !== undefined) { items[key].feedback = kept.feedback; }
         });
         return items;
     }
@@ -197,19 +223,21 @@ function designDetail() {
 
     async function load() {
         try {
+            stash();
             const next = await designFetch("/sessions/" + designId);
-            if (dirty && record && next.revision !== record.revision) {
-                designShowError(
-                    "This page changed while you were typing. Your text is still here — " +
-                    "reload to take the new version, or submit to keep yours."
-                );
-                return;
-            }
+            const moved = record && next.revision !== record.revision;
+            /* The record is always taken, even when it moved under a
+               half-typed box: keeping a stale one is how a 409 becomes
+               permanent, since every later write carries the old revision.
+               What Daniel typed lives in the stash and survives the redraw. */
             record = next;
             drawChrome();
             drawItems();
-            dirty = false;
-            designShowError("");
+            designShowError(
+                moved
+                    ? "This page was updated while you were typing. Your text is still here."
+                    : ""
+            );
         } catch (err) { designShowError(err.message); }
     }
 
@@ -223,19 +251,19 @@ function designDetail() {
                     body: JSON.stringify(Object.assign({ revision: record.revision }, body)),
                 }
             );
-            dirty = false;
+            pending[page] = {};
             await load();
         } catch (err) {
-            designShowError(
-                err.status === 409
-                    ? err.message + " — reload to see what changed."
-                    : err.message
-            );
+            /* A conflict is recoverable: take the new record so the next
+               attempt carries a live revision, and keep what was typed. */
+            if (err.status === 409) { await load(); }
+            designShowError(err.message);
         }
     }
 
     document.querySelectorAll(".design-tab").forEach(function (tab) {
         tab.addEventListener("click", function () {
+            stash();
             page = tab.dataset.page;
             drawChrome();
             drawItems();
@@ -248,7 +276,15 @@ function designDetail() {
         if (page === "functions") {
             post("submit", { items: collect(), action: "build" });
         } else {
-            post("accept", {});
+            post("accept", {}).then(function () {
+                /* Accept advances. Leaving Daniel on the page he just
+                   accepted, with only the buttons flickering, reads as a
+                   button that did nothing. */
+                stash();
+                page = page === "requirements" ? "tests" : "functions";
+                drawChrome();
+                drawItems();
+            });
         }
     });
 

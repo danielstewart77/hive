@@ -33,7 +33,6 @@ is how two browser tabs quietly delete each other's work.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sqlite3
@@ -52,14 +51,18 @@ NOTICE_KINDS = ("feedback", "build")
 _MIND_FIELDS: dict[str, tuple[str, ...]] = {
     "requirements": ("order", "text", "answer"),
     "tests": ("order", "requirement", "symbol", "cases", "sentence", "answer"),
+    # Named to match what `design_graph.trim_call_graph` emits. A field the
+    # trim produces and this tuple omits is dropped on publish and the page
+    # renders blank — which is the whole of page three, silently.
     "functions": (
         "order",
         "name",
         "file",
         "repo",
         "changed",
-        "callers",
-        "callees",
+        "role",
+        "calls",
+        "called_by",
         "params",
         "args",
         "answer",
@@ -292,15 +295,18 @@ def attach_design_session(
     rotation mints a new session id and closes the old one, so without this
     every later submission would queue against a tombstone while the page
     went on displaying a conversation that looked perfectly healthy.
+
+    The revision is deliberately not bumped. A mind re-claims on every turn
+    that touches a design session, and a bump would invalidate whatever
+    Daniel was halfway through typing each time it did.
     """
     get_design_session(design_id)
     with _connect() as connection:
         connection.execute(
             """
             UPDATE design_sessions
-               SET conversation_id = ?, surface = ?,
-                   mind_id = COALESCE(?, mind_id),
-                   revision = revision + 1, updated_at = ?
+               SET conversation_id = ?, surface = COALESCE(?, surface),
+                   mind_id = COALESCE(?, mind_id), updated_at = ?
              WHERE id = ?
             """,
             (conversation_id, surface, mind_id, _now(), design_id),
@@ -311,6 +317,19 @@ def attach_design_session(
 # ---------------------------------------------------------------------------
 # Publishing (the Mind) and submitting (Daniel)
 # ---------------------------------------------------------------------------
+
+
+def _same_text(left: Any, right: Any) -> bool:
+    """Whether two pieces of prose are the same to a reader.
+
+    A browser hands back what a textarea holds, and a textarea normalises
+    CRLF and can drop a leading newline. Compared raw, any stored text with
+    Windows line endings reads as edited on every single submit, and the
+    Mind is told Daniel rewrote the whole page each time.
+    """
+    if not isinstance(left, str) or not isinstance(right, str):
+        return left == right
+    return left.replace("\r\n", "\n").strip("\n") == right.replace("\r\n", "\n").strip("\n")
 
 
 def _touched(item: dict[str, Any]) -> bool:
@@ -375,11 +394,22 @@ def publish_page(
         incoming = items.get(key)
         may_change = (not protected) or _touched(current)
         if incoming is None:
-            # Omitted. On a protected page only a flagged item may be
-            # dropped, so a Mind cannot quietly delete a requirement Daniel
-            # signed off on. Elsewhere the page is the Mind's to rewrite.
+            # Omitted. On a protected page that keeps the item: a Mind
+            # publishing a partial page — reconciling ids badly, or leaving
+            # out what it thinks it already answered — must not be able to
+            # delete a requirement, and least of all the flagged one Daniel
+            # is still arguing about. Elsewhere the page is the Mind's to
+            # rewrite wholesale.
+            if not protected:
+                continue
+            merged[key] = item
+            continue
+        if incoming.get("deleted"):
+            # Deletion is a thing the Mind says, not a thing it omits, and
+            # on page one it still needs Daniel to have flagged the item.
             if not protected or may_change:
                 continue
+            refused.append(key)
             merged[key] = item
             continue
         changes = {
@@ -387,6 +417,13 @@ def publish_page(
             for field in mind_fields
             if field in incoming and incoming[field] != current.get(field)
         }
+        # Position is not content. Splitting one requirement in two moves
+        # every sibling below it, and refusing that would make inserting a
+        # requirement impossible — which is precisely what the separate
+        # `order` field exists to allow.
+        reorder = changes.pop("order", None)
+        if reorder is not None:
+            item["order"] = reorder
         if changes and not may_change:
             refused.append(key)
             merged[key] = item
@@ -418,7 +455,10 @@ def publish_page(
     else:
         stale[page] = False
 
-    return _write_page(design_id, page, merged, accepted=accepted, stale=stale)
+    return _write_page(
+        design_id, page, merged, accepted=accepted, stale=stale,
+        expected_revision=record["revision"],
+    )
 
 
 def submit_page(
@@ -443,11 +483,27 @@ def submit_page(
         raise DesignError("Build is only offered on the functions page")
     record = get_design_session(design_id)
     _check_revision(record, revision)
-    if action == "build" and not record["conversation_id"]:
-        raise DesignError(
-            "This design session is not attached to a conversation, so there is"
-            " nobody to build it"
-        )
+    if action == "build":
+        if not record["conversation_id"]:
+            raise DesignError(
+                "This design session is not attached to a conversation, so there"
+                " is nobody to build it"
+            )
+        # Build is the one press that starts a harness writing code, so it
+        # consults every gate rather than only the one on the page it was
+        # pressed from. A disabled button is a courtesy; this is the check.
+        for gate_page in PAGES:
+            allowed, reason = can_advance(design_id, gate_page)
+            if not allowed:
+                raise DesignError(f"{gate_page}: {reason}")
+            if record["stale"].get(gate_page):
+                raise DesignError(
+                    f"{gate_page} was written against older requirements"
+                )
+            # Pages one and two are accepted explicitly; page three is
+            # accepted by this press, which is what Build means.
+            if gate_page != "functions" and not record["accepted"].get(gate_page):
+                raise DesignError(f"{gate_page} has not been accepted yet")
     existing: dict[str, dict[str, Any]] = record[page]
     editable = _DANIEL_FIELDS[page]
 
@@ -456,7 +512,7 @@ def submit_page(
         item = dict(current)
         incoming = items.get(key) or {}
         for field in editable:
-            if field in incoming and incoming[field] != current.get(field):
+            if field in incoming and not _same_text(incoming[field], current.get(field)):
                 item[field] = incoming[field]
                 if field != "feedback":
                     item["edited"] = True
@@ -468,9 +524,10 @@ def submit_page(
     if page == "requirements":
         stale.update(_downstream_stale(record["requirements"], merged, record))
 
-    updated = _write_page(design_id, page, merged, accepted=accepted, stale=stale)
-    _queue_notice(design_id, kind=action, page=page)
-    return updated
+    return _write_page(
+        design_id, page, merged, accepted=accepted, stale=stale,
+        expected_revision=record["revision"], notice=(action, page),
+    )
 
 
 def accept_page(
@@ -488,10 +545,17 @@ def accept_page(
     allowed, reason = can_advance(design_id, page)
     if not allowed:
         raise DesignError(reason)
+    if record["stale"].get(page):
+        raise DesignError(
+            "This page was written against older requirements — it has to be"
+            " republished before it can be accepted"
+        )
     accepted = dict(record["accepted"])
     accepted[page] = True
-    return _write_page(design_id, page, record[page], accepted=accepted,
-                       stale=record["stale"])
+    return _write_page(
+        design_id, page, record[page], accepted=accepted, stale=record["stale"],
+        expected_revision=record["revision"],
+    )
 
 
 def _downstream_stale(
@@ -519,19 +583,52 @@ def _write_page(
     *,
     accepted: dict[str, Any],
     stale: dict[str, Any],
+    expected_revision: int,
+    notice: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
+    """Write one page, but only if the record is still where it was read.
+
+    The revision travels into the UPDATE itself rather than being compared
+    in Python beforehand. A read, a check and a write across three
+    connections leaves a window wide enough for two browser tabs to both
+    pass the check and both write, and the second one wins silently — which
+    is the exact failure the revision exists to prevent.
+
+    A notice is queued on the same connection, so a submission cannot end up
+    stored with nobody ever told about it, or a notice orphaned against a
+    session that was deleted between the two writes.
+    """
     with _connect() as connection:
-        connection.execute(
+        cursor = connection.execute(
             f"UPDATE design_sessions SET {page} = ?, accepted = ?, stale = ?,"
-            " revision = revision + 1, updated_at = ? WHERE id = ?",
+            " revision = revision + 1, updated_at = ?"
+            " WHERE id = ? AND revision = ?",
             (
                 json.dumps(items),
                 json.dumps(accepted),
                 json.dumps(stale),
                 _now(),
                 design_id,
+                expected_revision,
             ),
         )
+        if cursor.rowcount == 0:
+            row = connection.execute(
+                "SELECT revision FROM design_sessions WHERE id = ?", (design_id,)
+            ).fetchone()
+            if row is None:
+                raise DesignNotFound(f"No design session {design_id}")
+            raise DesignConflict(
+                f"Design session moved to revision {row['revision']};"
+                f" this write was made against {expected_revision}"
+            )
+        if notice is not None:
+            kind, notice_page = notice
+            connection.execute(
+                "INSERT INTO design_notices (design_id, kind, page, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (design_id, kind, notice_page, _now()),
+            )
     return get_design_session(design_id)
 
 
@@ -549,30 +646,35 @@ def can_advance(design_id: str, page: str) -> tuple[bool, str]:
         return False, "This page has nothing on it yet"
     if page == "tests":
         planned = {
-            str(item.get("name") or "") for item in record["functions"].values()
+            str(item["name"])
+            for item in record["functions"].values()
+            if str(item.get("name") or "").strip()
         }
         unresolved = []
         for key, item in items.items():
             symbol = item.get("symbol") or {}
             if symbol.get("resolved"):
                 continue
-            if symbol.get("kind") == "planned" and symbol.get("name") in planned:
+            named = str(symbol.get("name") or "").strip()
+            if symbol.get("kind") == "planned" and named and named in planned:
                 continue
             unresolved.append(symbol.get("name") or key)
         if unresolved:
             return False, "Unresolved functions: " + ", ".join(sorted(unresolved))
+        thin = []
+        for key, item in items.items():
+            outcomes = {
+                str(case.get("outcome") or "").lower()
+                for case in (item.get("cases") or [])
+            }
+            if not {"pass", "fail"} <= outcomes:
+                thin.append(str(item.get("sentence") or key))
+        if thin:
+            return False, (
+                "These tests need a value that should succeed and one that"
+                " should fail: " + ", ".join(sorted(thin))
+            )
     return True, ""
-
-
-def source_fingerprint(text: str) -> str:
-    """Hash of resolved source, so drift after publication is visible.
-
-    Page two shows source read off disk at publish time. Without a recorded
-    fingerprint, an edit to that file afterwards leaves the page displaying
-    a snapshot labelled live, and Daniel signs off on a test against code
-    that is no longer there.
-    """
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------

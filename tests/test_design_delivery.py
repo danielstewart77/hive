@@ -186,3 +186,77 @@ def test_pending_work_is_sent_on_startup(store, gateway):
     ]
     assert store.pending_notices(first["id"]) == []
     assert store.pending_notices(second["id"]) == []
+
+
+def test_a_notice_owed_while_nothing_was_attached_is_sent_once_it_is(store, gateway):
+    record = _session_with_feedback(store, conversation_id=None)
+    assert asyncio.run(design_delivery.deliver_pending()) == 0
+    assert gateway.calls == []
+
+    store.attach_design_session(record["id"], "conv-late", surface="telegram")
+
+    assert asyncio.run(design_delivery.deliver_pending()) == 1
+    assert gateway.paths == [
+        "/sessions/conv-late/activate",
+        "/sessions/conv-late/message",
+    ]
+
+
+def test_a_cancelled_send_releases_its_notice_rather_than_stranding_it(store, gateway):
+    record = _session_with_feedback(store)
+    notice_id = store.pending_notices(record["id"])[0]["id"]
+
+    def cancelled(path, body, *, headers, stream):
+        raise asyncio.CancelledError()
+
+    gateway._post = cancelled
+    import design_delivery as module
+
+    original = module._post_sync
+    module._post_sync = cancelled
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(design_delivery.deliver_notice(notice_id))
+    finally:
+        module._post_sync = original
+
+    pending = store.pending_notices(record["id"])
+    assert [n["id"] for n in pending] == [notice_id]
+    assert pending[0]["claimed_at"] is None
+
+
+def test_the_build_message_carries_the_whole_agreed_specification(store):
+    record = store.create_design_session("Design", conversation_id="conv-1")
+    record = store.publish_page(
+        record["id"],
+        "requirements",
+        {"r1": {"order": 1, "text": "Every design session is listed"}},
+        revision=record["revision"],
+    )
+    record = store.publish_page(
+        record["id"],
+        "functions",
+        {"f1": {"order": 1, "name": "list_design_sessions", "changed": True,
+                "calls": ["_connect"]}},
+        revision=record["revision"],
+    )
+    record = store.publish_page(
+        record["id"],
+        "tests",
+        {"t1": {"order": 1, "sentence": "Listing reports every session",
+                "symbol": {"name": "list_design_sessions", "kind": "existing",
+                           "resolved": True, "path": "src/design_data.py"},
+                "cases": [
+                    {"input": "two stored", "expected": "both returned", "outcome": "pass"},
+                    {"input": "a deleted id", "expected": "absent", "outcome": "fail"},
+                ]}},
+        revision=record["revision"],
+    )
+
+    content = design_delivery.compose_message(record, "functions", "build")
+
+    assert "Every design session is listed" in content
+    assert "Listing reports every session" in content
+    assert "src/design_data.py" in content
+    assert "both returned" in content
+    assert "calls: _connect" in content

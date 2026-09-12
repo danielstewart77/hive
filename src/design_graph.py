@@ -73,6 +73,28 @@ def trim_call_graph(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for name in changed
         if not any(callee in changed for callee in _callees(indexed[name]))
     }
+    if not leaves:
+        # A cycle again: every changed function calls another changed one, so
+        # nothing looks like the bottom. Any changed function that also calls
+        # something unchanged is where the chain leaves the change set, which
+        # is what the neighbour below is for.
+        leaves = {
+            name
+            for name in changed
+            if any(callee not in changed for callee in _callees(indexed[name]))
+        }
+
+    if not entries:
+        # Every changed function has a changed caller — mutual recursion, or
+        # a cycle. There is no entry point to hang the neighbour off, so the
+        # rule falls back to "any changed function an unchanged one calls",
+        # which is what a reader means by the top of the chain anyway.
+        entries = [
+            name
+            for name in order
+            if name in changed
+            and any(caller not in changed for caller in _callers_of(name, indexed))
+        ]
 
     keep: dict[str, str] = {}
     for entry in entries:
@@ -103,7 +125,10 @@ def trim_call_graph(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     for entry in entries:
         for caller, role in keep.items():
-            if role == CONTEXT and entry in _callees(indexed[caller]):
+            # A mind naming an unchanged callee without also describing it is
+            # the ordinary case — a helper, a stdlib call — so a name with no
+            # node behind it is context to show, never a key to index.
+            if role == CONTEXT and entry in _callees(indexed.get(caller, {})):
                 walk(caller)
         walk(entry)
     for name in order:

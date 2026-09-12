@@ -468,6 +468,11 @@ def _resolved_test(name: str, resolved: bool, kind: str = "existing") -> dict:
         "order": 1,
         "sentence": f"{name} behaves",
         "symbol": {"name": name, "kind": kind, "resolved": resolved},
+        "cases": [
+            {"input": "a known good value", "expected": "accepted", "outcome": "pass"},
+            {"input": "a value the store says is absent", "expected": "refused",
+             "outcome": "fail"},
+        ],
     }
 
 
@@ -572,14 +577,31 @@ def test_a_submission_un_accepts_the_page_it_lands_on(store):
 
 
 def _built(store, **kwargs):
+    """A design session with all three pages published and the first two
+    accepted — the state Build is actually allowed from."""
     record = store.create_design_session("Design", **kwargs)
-    with_functions = store.publish_page(
+    record = store.publish_page(
+        record["id"],
+        "requirements",
+        _requirements("Sessions are listed"),
+        revision=record["revision"],
+    )
+    record = store.publish_page(
         record["id"],
         "functions",
         {"f1": {"order": 1, "name": "publish_page", "changed": True}},
         revision=record["revision"],
     )
-    return with_functions
+    record = store.publish_page(
+        record["id"],
+        "tests",
+        {"t1": _resolved_test("publish_page", True)},
+        revision=record["revision"],
+    )
+    record = store.accept_page(
+        record["id"], "requirements", revision=record["revision"]
+    )
+    return store.accept_page(record["id"], "tests", revision=record["revision"])
 
 
 def test_feedback_and_build_queue_different_notices(store):
@@ -674,3 +696,271 @@ def test_a_submission_survives_a_conversation_that_no_longer_exists(store):
         store.get_design_session(submitted["id"])["functions"]["f1"]["feedback"]
         == "Asked while the conversation was dead"
     )
+
+
+# --- What the code grill found ----------------------------------------------
+
+
+def test_two_writers_at_one_revision_cannot_both_win(store, monkeypatch):
+    """The revision travels into the UPDATE, so the loser is refused even
+    when both callers passed the Python-side check before either wrote."""
+    record = store.create_design_session("Design")
+    published = store.publish_page(
+        record["id"],
+        "requirements",
+        _requirements("Sessions are listed"),
+        revision=record["revision"],
+    )
+    revision = published["revision"]
+
+    real_write = store._write_page
+    landed = []
+
+    def racing_write(design_id, page, items, **kwargs):
+        # The other tab lands between this caller's check and its write.
+        if not landed:
+            landed.append(True)
+            real_write(
+                design_id,
+                page,
+                {"r1": dict(published["requirements"]["r1"], feedback="TAB-ONE")},
+                accepted=kwargs["accepted"],
+                stale=kwargs["stale"],
+                expected_revision=revision,
+            )
+        return real_write(design_id, page, items, **kwargs)
+
+    monkeypatch.setattr(store, "_write_page", racing_write)
+
+    with pytest.raises(store.DesignConflict):
+        store.submit_page(
+            published["id"],
+            "requirements",
+            items={"r1": {"feedback": "TAB-TWO"}},
+            revision=revision,
+        )
+
+    after = store.get_design_session(published["id"])
+    assert after["requirements"]["r1"]["feedback"] == "TAB-ONE"
+    assert len(store.pending_notices(published["id"])) == 0
+
+
+def test_a_partial_publish_does_not_delete_the_requirement_daniel_asked_about(store):
+    record = store.create_design_session("Design")
+    published = store.publish_page(
+        record["id"],
+        "requirements",
+        _requirements("Sessions are listed", "Sessions can be deleted"),
+        revision=record["revision"],
+    )
+    submitted = store.submit_page(
+        published["id"],
+        "requirements",
+        items={"r1": {"feedback": "In what order?"}},
+        revision=published["revision"],
+    )
+
+    revised = store.publish_page(
+        submitted["id"],
+        "requirements",
+        {"r1": {"order": 1, "text": "Sessions are listed newest first"}},
+        revision=submitted["revision"],
+    )
+
+    assert set(revised["requirements"]) == {"r1", "r2"}
+    assert revised["requirements"]["r2"]["text"] == "Sessions can be deleted"
+
+
+def test_a_flagged_requirement_can_be_deleted_when_the_mind_says_so(store):
+    record = store.create_design_session("Design")
+    published = store.publish_page(
+        record["id"],
+        "requirements",
+        _requirements("Sessions are listed", "Sessions can be deleted"),
+        revision=record["revision"],
+    )
+    submitted = store.submit_page(
+        published["id"],
+        "requirements",
+        items={"r2": {"feedback": "Drop this one, it is covered by 1"}},
+        revision=published["revision"],
+    )
+
+    revised = store.publish_page(
+        submitted["id"],
+        "requirements",
+        {
+            "r1": {"order": 1, "text": "Sessions are listed"},
+            "r2": {"deleted": True},
+        },
+        revision=submitted["revision"],
+    )
+
+    assert set(revised["requirements"]) == {"r1"}
+
+
+def test_deleting_a_requirement_daniel_left_alone_is_refused(store):
+    record = store.create_design_session("Design")
+    published = store.publish_page(
+        record["id"],
+        "requirements",
+        _requirements("Sessions are listed", "Sessions can be deleted"),
+        revision=record["revision"],
+    )
+
+    with pytest.raises(store.DesignRefused):
+        store.publish_page(
+            published["id"],
+            "requirements",
+            {
+                "r1": {"order": 1, "text": "Sessions are listed"},
+                "r2": {"deleted": True},
+            },
+            revision=published["revision"],
+        )
+
+    assert set(store.get_design_session(published["id"])["requirements"]) == {"r1", "r2"}
+
+
+def test_build_is_refused_while_a_page_is_unaccepted(store):
+    record = _built(store, conversation_id="conv-a")
+    reopened = store.submit_page(
+        record["id"],
+        "requirements",
+        items={"r1": {"feedback": "One more thing"}},
+        revision=record["revision"],
+    )
+
+    with pytest.raises(store.DesignError):
+        store.submit_page(
+            reopened["id"], "functions", items={}, action="build",
+            revision=reopened["revision"],
+        )
+
+
+def test_build_is_refused_while_the_tests_page_is_stale(store):
+    record = _built(store, conversation_id="conv-a")
+    stale = store.submit_page(
+        record["id"],
+        "requirements",
+        items={"r1": {"text": "Sessions are listed newest first"}},
+        revision=record["revision"],
+    )
+    assert stale["stale"]["tests"] is True
+
+    with pytest.raises(store.DesignError):
+        store.submit_page(
+            stale["id"], "functions", items={}, action="build",
+            revision=stale["revision"],
+        )
+
+
+def test_build_is_refused_while_a_test_names_an_unresolved_function(store):
+    record = _built(store, conversation_id="conv-a")
+    broken = store.publish_page(
+        record["id"],
+        "tests",
+        {"t1": _resolved_test("publsh_page", False)},
+        revision=record["revision"],
+    )
+    reaccepted = store.accept_page  # the gate refuses, so acceptance cannot be regained
+
+    with pytest.raises(store.DesignError):
+        reaccepted(broken["id"], "tests", revision=broken["revision"])
+    with pytest.raises(store.DesignError):
+        store.submit_page(
+            broken["id"], "functions", items={}, action="build",
+            revision=broken["revision"],
+        )
+
+
+def test_a_stale_page_cannot_be_accepted(store):
+    record = _built(store, conversation_id="conv-a")
+    stale = store.submit_page(
+        record["id"],
+        "requirements",
+        items={"r1": {"text": "Sessions are listed newest first"}},
+        revision=record["revision"],
+    )
+
+    with pytest.raises(store.DesignError):
+        store.accept_page(stale["id"], "tests", revision=stale["revision"])
+
+
+def test_a_planned_symbol_with_no_name_does_not_pass_the_gate(store):
+    record = store.create_design_session("Design")
+    with_functions = store.publish_page(
+        record["id"],
+        "functions",
+        {"f1": {"order": 1, "name": "", "changed": True}},
+        revision=record["revision"],
+    )
+    published = store.publish_page(
+        with_functions["id"],
+        "tests",
+        {"t1": {"order": 1, "sentence": "something", "symbol": {"name": "", "kind": "planned", "resolved": False}}},
+        revision=with_functions["revision"],
+    )
+
+    allowed, _ = store.can_advance(published["id"], "tests")
+
+    assert allowed is False
+
+
+def test_a_windows_line_ending_round_trip_is_not_an_edit(store):
+    record = store.create_design_session("Design")
+    published = store.publish_page(
+        record["id"],
+        "requirements",
+        {"r1": {"order": 1, "text": "First line\r\nsecond line"}},
+        revision=record["revision"],
+    )
+
+    submitted = store.submit_page(
+        published["id"],
+        "requirements",
+        items={"r1": {"text": "First line\nsecond line"}},
+        revision=published["revision"],
+    )
+
+    assert submitted["requirements"]["r1"].get("edited") is not True
+
+
+def test_re_attaching_does_not_invalidate_what_daniel_is_typing(store):
+    record = store.create_design_session("Design", conversation_id="conv-a")
+    published = store.publish_page(
+        record["id"],
+        "requirements",
+        _requirements("Sessions are listed"),
+        revision=record["revision"],
+    )
+
+    store.attach_design_session(published["id"], "conv-b", surface="telegram")
+
+    submitted = store.submit_page(
+        published["id"],
+        "requirements",
+        items={"r1": {"feedback": "Typed before the re-claim"}},
+        revision=published["revision"],
+    )
+    assert submitted["requirements"]["r1"]["feedback"] == "Typed before the re-claim"
+
+
+def test_a_submission_stores_its_notice_in_the_same_write(store, monkeypatch):
+    """A page written with nobody told about it is a submission that vanishes."""
+    record = store.create_design_session("Design", conversation_id="conv-a")
+    published = store.publish_page(
+        record["id"],
+        "requirements",
+        _requirements("Sessions are listed"),
+        revision=record["revision"],
+    )
+
+    store.submit_page(
+        published["id"],
+        "requirements",
+        items={"r1": {"feedback": "A question"}},
+        revision=published["revision"],
+    )
+
+    assert [n["kind"] for n in store.pending_notices(published["id"])] == ["feedback"]

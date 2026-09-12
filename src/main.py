@@ -92,6 +92,11 @@ _canvas_elements: list[dict] = []
 log = configure_logging("hive-control-plane")
 
 
+# Live design-delivery tasks, held so the event loop's weak references
+# cannot collect one while it is waiting out a model turn.
+_DESIGN_DELIVERIES: set = set()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     del app
@@ -100,6 +105,13 @@ async def lifespan(app: FastAPI):
     global _canvas_elements
     _canvas_elements = _load_canvas_state()
     log_event(log, "service.started", component="hive-control-plane")
+    # Anything a design session was owed when this process last stopped. A
+    # console restarted between a submission being stored and its send is
+    # otherwise a submission nobody is ever told about, and the page shows
+    # it as saved with no error and nothing pending.
+    startup_delivery = asyncio.create_task(design_delivery.deliver_pending())
+    _DESIGN_DELIVERIES.add(startup_delivery)
+    startup_delivery.add_done_callback(_DESIGN_DELIVERIES.discard)
     try:
         yield
     finally:
@@ -3237,7 +3249,7 @@ async def api_design_attach(
 ):
     del actor
     try:
-        return design_data.attach_design_session(
+        record = design_data.attach_design_session(
             design_id,
             payload.get("conversation_id"),
             surface=payload.get("surface"),
@@ -3245,6 +3257,13 @@ async def api_design_attach(
         )
     except design_data.DesignError as exc:
         raise _design_error(exc) from exc
+    # Anything submitted while nothing was attached is owed to this
+    # conversation. Without this, "stored and read when next attached" is a
+    # promise nothing keeps: re-attaching delivers none of it.
+    task = asyncio.create_task(design_delivery.deliver_pending())
+    _DESIGN_DELIVERIES.add(task)
+    task.add_done_callback(_DESIGN_DELIVERIES.discard)
+    return record
 
 
 @app.post(f"{DESIGN_PREFIX}/sessions/{{design_id}}/pages/{{page}}/publish")
@@ -3283,7 +3302,13 @@ async def api_design_submit(
     # Detached: the send adopts the conversation and waits out a whole model
     # turn, and the browser must not sit on that. The submission is already
     # stored, so a delivery that fails is retried rather than lost.
-    asyncio.create_task(design_delivery.deliver_pending())
+    #
+    # The handle is kept until it finishes. A bare `create_task` holds no
+    # strong reference, and a task collected mid-send loses the submission
+    # exactly as silently as no task at all.
+    task = asyncio.create_task(design_delivery.deliver_pending())
+    _DESIGN_DELIVERIES.add(task)
+    task.add_done_callback(_DESIGN_DELIVERIES.discard)
     return record
 
 
@@ -3315,11 +3340,26 @@ async def api_design_trim_graph(
 
 @app.get(f"{DESIGN_PREFIX}/symbols")
 async def api_design_symbol(
-    mind: str, path: str, name: str, repo: str = "",
+    mind: str, path: str, name: str, repo: str = "", design_id: str = "",
     actor: dict = Depends(require_design_writer),
 ):
-    """Resolve a function through the Mind whose disk it lives on."""
+    """Resolve a function through the Mind whose disk it lives on.
+
+    The repository is named, never inferred. A Mind asked for a bare name
+    resolves against whichever checkout it happens to have declared first,
+    which on a host holding three of them returns real source from the wrong
+    one — with `resolved: true` and a line span that checks out.
+    """
     del actor
+    if not repo and design_id:
+        targets = design_data.get_design_session(design_id)["repos"]
+        if len(targets) == 1:
+            repo = targets[0]
+    if not repo:
+        raise HTTPException(
+            status_code=400,
+            detail="Name the repository — this host holds more than one checkout",
+        )
     gateway_url = await _mind_gateway_url(mind)
     return await mind_symbols.resolve(gateway_url, repo, path, name)
 
