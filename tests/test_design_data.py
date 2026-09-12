@@ -839,6 +839,9 @@ def test_build_is_refused_while_a_page_is_unaccepted(store):
 
 
 def test_build_is_refused_while_the_tests_page_is_stale(store):
+    """Stale *and* accepted. Editing a requirement also un-accepts page one,
+    so re-accepting it is what leaves staleness as the only thing standing —
+    without that, the acceptance gate answers and this proves nothing."""
     record = _built(store, conversation_id="conv-a")
     stale = store.submit_page(
         record["id"],
@@ -847,12 +850,20 @@ def test_build_is_refused_while_the_tests_page_is_stale(store):
         revision=record["revision"],
     )
     assert stale["stale"]["tests"] is True
+    reaccepted = store.accept_page(
+        stale["id"], "requirements", revision=stale["revision"]
+    )
+    assert reaccepted["accepted"]["requirements"] is True
+    assert reaccepted["accepted"]["tests"] is True
+    assert reaccepted["stale"]["tests"] is True
 
-    with pytest.raises(store.DesignError):
+    with pytest.raises(store.DesignError) as refusal:
         store.submit_page(
-            stale["id"], "functions", items={}, action="build",
-            revision=stale["revision"],
+            reaccepted["id"], "functions", items={}, action="build",
+            revision=reaccepted["revision"],
         )
+
+    assert "older requirements" in str(refusal.value)
 
 
 def test_build_is_refused_while_a_test_names_an_unresolved_function(store):
@@ -898,13 +909,20 @@ def test_a_planned_symbol_with_no_name_does_not_pass_the_gate(store):
     published = store.publish_page(
         with_functions["id"],
         "tests",
-        {"t1": {"order": 1, "sentence": "something", "symbol": {"name": "", "kind": "planned", "resolved": False}}},
+        {
+            "t1": dict(
+                _resolved_test("", False, kind="planned"),
+                sentence="something",
+            )
+        },
         revision=with_functions["revision"],
     )
 
-    allowed, _ = store.can_advance(published["id"], "tests")
+    allowed, reason = store.can_advance(published["id"], "tests")
 
     assert allowed is False
+    # Named, so the cases gate cannot be the one answering.
+    assert "Unresolved" in reason
 
 
 def test_a_windows_line_ending_round_trip_is_not_an_edit(store):
@@ -964,3 +982,135 @@ def test_a_submission_stores_its_notice_in_the_same_write(store, monkeypatch):
     )
 
     assert [n["kind"] for n in store.pending_notices(published["id"])] == ["feedback"]
+
+
+def test_a_requirement_can_be_inserted_between_two_others(store):
+    """Position is not content. Splitting one requirement in two moves every
+    sibling below it, and refusing that as an unauthorised rewrite is what
+    made inserting a requirement impossible."""
+    record = store.create_design_session("Design")
+    published = store.publish_page(
+        record["id"],
+        "requirements",
+        _requirements("First", "Second"),
+        revision=record["revision"],
+    )
+    submitted = store.submit_page(
+        published["id"],
+        "requirements",
+        items={"r1": {"feedback": "Split this into two"}},
+        revision=published["revision"],
+    )
+
+    revised = store.publish_page(
+        submitted["id"],
+        "requirements",
+        {
+            "r1": {"order": 1, "text": "First, part one"},
+            "r1b": {"order": 2, "text": "First, part two"},
+            "r2": {"order": 3, "text": "Second"},
+        },
+        revision=submitted["revision"],
+    )
+
+    assert [item["text"] for item in store.ordered_items(revised, "requirements")] == [
+        "First, part one",
+        "First, part two",
+        "Second",
+    ]
+
+
+def test_moving_an_untouched_requirement_does_not_change_its_words(store):
+    """The exemption is for position alone — it must not become a hole the
+    text can travel through."""
+    record = store.create_design_session("Design")
+    published = store.publish_page(
+        record["id"],
+        "requirements",
+        _requirements("First", "Second"),
+        revision=record["revision"],
+    )
+    submitted = store.submit_page(
+        published["id"],
+        "requirements",
+        items={"r1": {"feedback": "Split this"}},
+        revision=published["revision"],
+    )
+
+    with pytest.raises(store.DesignRefused) as refusal:
+        store.publish_page(
+            submitted["id"],
+            "requirements",
+            {
+                "r1": {"order": 1, "text": "First, revised"},
+                "r2": {"order": 3, "text": "Second, quietly reworded"},
+            },
+            revision=submitted["revision"],
+        )
+
+    assert refusal.value.keys == ["r2"]
+
+
+def test_a_test_with_only_a_passing_case_does_not_pass_the_gate(store):
+    record = store.create_design_session("Design")
+    published = store.publish_page(
+        record["id"],
+        "tests",
+        {
+            "t1": {
+                "order": 1,
+                "sentence": "Listing reports every session",
+                "symbol": {"name": "list_design_sessions", "kind": "existing",
+                           "resolved": True},
+                "cases": [
+                    {"input": "two stored", "expected": "both returned",
+                     "outcome": "pass"}
+                ],
+            }
+        },
+        revision=record["revision"],
+    )
+
+    allowed, reason = store.can_advance(published["id"], "tests")
+
+    assert allowed is False
+    assert "succeed" in reason and "fail" in reason
+
+
+def test_a_test_with_both_a_passing_and_a_failing_case_passes_the_gate(store):
+    record = store.create_design_session("Design")
+    published = store.publish_page(
+        record["id"],
+        "tests",
+        {"t1": _resolved_test("list_design_sessions", True)},
+        revision=record["revision"],
+    )
+
+    allowed, reason = store.can_advance(published["id"], "tests")
+
+    assert allowed is True
+    assert reason == ""
+
+
+def test_build_pressed_from_the_wrong_page_is_refused(store):
+    record = _built(store, conversation_id="conv-a")
+
+    with pytest.raises(store.DesignError):
+        store.submit_page(
+            record["id"], "requirements", items={}, action="build",
+            revision=record["revision"],
+        )
+
+    assert store.pending_notices(record["id"]) == []
+
+
+def test_an_action_that_is_neither_feedback_nor_build_is_refused(store):
+    record = _built(store, conversation_id="conv-a")
+
+    with pytest.raises(store.DesignError):
+        store.submit_page(
+            record["id"], "functions", items={}, action="ship-it",
+            revision=record["revision"],
+        )
+
+    assert store.pending_notices(record["id"]) == []

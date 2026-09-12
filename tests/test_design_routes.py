@@ -26,6 +26,12 @@ def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("HIVE_DB_PATH", str(tmp_path / "hive.db"))
     monkeypatch.setenv("HIVE_SECRET_KEY", "test-secret")
     monkeypatch.setenv("DESIGN_PUSH_TOKEN", PUSH_TOKEN)
+    # The house tokens are removed, not left to the invoking shell. Every
+    # mind in the hive holds both, so a fallback to either is the whole
+    # threat this credential exists to close — and on Daniel's own machine
+    # they are exported, which would let that fallback pass unnoticed.
+    monkeypatch.delenv("COMMS_ADMIN_BEARER_TOKEN", raising=False)
+    monkeypatch.delenv("COMMS_BEARER_TOKEN", raising=False)
 
 
 @pytest.fixture()
@@ -251,9 +257,24 @@ def test_the_symbol_route_takes_the_repository_from_a_single_target_session(mind
         },
     )
 
-    # It got past the "name the repository" refusal and on to reaching a Mind
-    # that is not there in this test.
-    assert response.status_code != 400
+    # Past the "name the repository" refusal and on to the Mind lookup,
+    # which fails here because no such Mind is registered. Asserting only
+    # "not 400" would pass on any later failure in the route just as happily.
+    assert response.status_code == 404
+    assert "repository" not in response.json()["detail"].lower()
+
+
+def test_the_house_tokens_do_not_open_the_design_routes(tmp_path, monkeypatch):
+    """The stated threat is a kid's Windows box publishing to these pages.
+    Both house tokens are set here, and neither may be accepted."""
+    _env(tmp_path, monkeypatch)
+    monkeypatch.setenv("COMMS_ADMIN_BEARER_TOKEN", "house-admin-token")
+    monkeypatch.setenv("COMMS_BEARER_TOKEN", "house-service-token")
+    client = TestClient(main_mod.app)
+
+    for house in ("house-admin-token", "house-service-token"):
+        client.headers.update({"Authorization": f"Bearer {house}"})
+        assert client.get(f"{main_mod.DESIGN_PREFIX}/sessions").status_code == 401
 
 
 def test_a_mind_with_no_symbols_route_is_reported_as_out_of_date(tmp_path, monkeypatch):

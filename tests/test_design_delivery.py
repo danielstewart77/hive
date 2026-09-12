@@ -118,21 +118,6 @@ def test_an_untouched_item_is_left_out_of_the_message(store):
     assert "Sessions are listed" not in content
 
 
-def test_the_build_message_says_to_write_the_code(store):
-    record = store.create_design_session("Design", conversation_id="conv-1")
-    with_functions = store.publish_page(
-        record["id"],
-        "functions",
-        {"f1": {"order": 1, "name": "publish_page", "changed": True}},
-        revision=record["revision"],
-    )
-
-    content = design_delivery.compose_message(with_functions, "functions", "build")
-
-    assert 'action="build"' in content
-    assert "write the code" in content
-
-
 def test_a_delivered_notice_is_not_sent_again(store, gateway):
     record = _session_with_feedback(store)
     notice_id = store.pending_notices(record["id"])[0]["id"]

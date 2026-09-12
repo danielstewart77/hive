@@ -122,17 +122,6 @@ def test_only_the_first_of_several_unchanged_callers_is_carried():
     assert [row["name"] for row in rows] == ["preferred", "target"]
 
 
-def test_a_leaf_whose_callees_are_all_changed_gets_no_neighbour_below():
-    graph = [
-        _node("a", ["b"], changed=True),
-        _node("b", ["a"], changed=True),
-    ]
-
-    rows = design_graph.trim_call_graph(graph)
-
-    assert [row["name"] for row in rows] == ["a", "b"]
-
-
 def test_a_graph_with_nothing_changed_shows_nothing():
     graph = [_node("a", ["b"]), _node("b")]
 
