@@ -486,7 +486,10 @@ def test_a_refused_setting_is_reported_as_a_refusal_with_the_minds_reason(monkey
         with pytest.raises(HTTPException) as refused:
             await mind_runtime.push_settings("http://mind:8420", {"goal_rounds": "x"})
         assert refused.value.status_code == 400
-        assert "whole number" in refused.value.detail
+        # The sentence itself, not a substring of the raw body: the raw JSON
+        # also contains those words, so a looser assertion holds while the
+        # operator is shown a serialized envelope.
+        assert refused.value.detail == "Goal rounds must be a whole number"
 
     _run(scenario())
 
@@ -516,5 +519,79 @@ def test_an_unreachable_mind_is_reported_as_unreachable(monkeypatch):
         with pytest.raises(HTTPException) as refused:
             await mind_runtime.push_settings("http://mind:8420", {"goal_rounds": 1})
         assert refused.value.status_code == 502
+
+    _run(scenario())
+
+
+def test_a_save_carries_the_admin_bearer_the_mind_demands(monkeypatch):
+    """The Mind's settings route is admin-guarded, so a save that forgot the
+    credential would 401 on every attempt in production with the shape of the
+    request still perfectly correct."""
+
+    async def scenario():
+        calls = []
+        monkeypatch.setattr(
+            mind_runtime.httpx,
+            "AsyncClient",
+            _Client(_response(200, _SETTINGS_BODY), calls=calls),
+        )
+        await mind_runtime.push_settings("http://mind:8420", {"goal_rounds": 1})
+        assert calls[0][2]["headers"]["Authorization"] == "Bearer admin-token"
+
+    _run(scenario())
+
+
+def test_a_minds_own_refusal_keeps_its_status_rather_than_becoming_a_bad_value(
+    monkeypatch,
+):
+    """A mind with no admin token configured answers 503. Flattened to 400 it
+    reaches the operator as a complaint about the value they typed, and they
+    go looking at the form instead of at the mind."""
+
+    async def scenario():
+        monkeypatch.setattr(
+            mind_runtime.httpx,
+            "AsyncClient",
+            _Client(_response(503, {"error": "no admin token configured"})),
+        )
+        with pytest.raises(HTTPException) as refused:
+            await mind_runtime.push_settings("http://mind:8420", {"goal_rounds": 1})
+        assert refused.value.status_code == 503
+
+    _run(scenario())
+
+
+def test_a_mind_answering_something_other_than_settings_is_not_passed_through(
+    monkeypatch,
+):
+    """A reverse proxy's own 200 page, or a mind answering a different route,
+    would otherwise reach the panel as a settings payload with no settings in
+    it."""
+
+    async def scenario():
+        monkeypatch.setattr(
+            mind_runtime.httpx, "AsyncClient", _Client(_response(200, {"ok": True}))
+        )
+        with pytest.raises(HTTPException) as refused:
+            await mind_runtime.fetch_settings("http://mind:8420")
+        assert refused.value.status_code == 502
+
+    _run(scenario())
+
+
+def test_a_save_with_nothing_in_it_never_reaches_the_mind(monkeypatch):
+    """An empty save is a write the mind would have to refuse, and a round
+    trip to be told so."""
+
+    async def scenario():
+        calls = []
+        monkeypatch.setattr(
+            mind_runtime.httpx,
+            "AsyncClient",
+            _Client(_response(200, _SETTINGS_BODY), calls=calls),
+        )
+        with pytest.raises(HTTPException):
+            await mind_runtime.push_settings("http://mind:8420", {})
+        assert calls == []
 
     _run(scenario())
