@@ -209,6 +209,18 @@ window.addEventListener("DOMContentLoaded", async function () {
         // The window belongs to the model and is read from the proxy, so it
         // is reported here and editable nowhere.
         rows.push(["Context window", state.context_window ? String(state.context_window) + " tokens" : "Not reported"]);
+        // The rotation threshold is a percentage of that window, so without
+        // one it resolves to nothing and the Mind falls back to its
+        // model-family default. Said here because the alternative is a
+        // setting that saves, displays the value it was given, and is ignored
+        // — with only an adjacent row reading "Not reported" to hint at it.
+        const threshold = (state.settings || []).find(function (entry) {
+            return entry.key === "rotation_threshold_percent";
+        });
+        if (threshold && threshold.present && !state.context_window) {
+            rows.push(["Rotation threshold", String(threshold.value) +
+                "% — not in effect until this Mind's model is saved, which is what caches the window"]);
+        }
         return rows;
     }
 
@@ -216,12 +228,18 @@ window.addEventListener("DOMContentLoaded", async function () {
         const id = "mind-setting-" + entry.key;
         const value = entry.present ? entry.value : "";
         let control;
+        // A setting the Mind has no line for gets an explicit "Not set" entry,
+        // selected. Without one a browser selects the first option of every
+        // select, so a save of one unrelated field would write Yes into every
+        // switch the file happened not to declare — turning on a thing the
+        // operator never looked at.
+        const unset = entry.present ? "" : '<option value="" selected>Not set</option>';
         if (entry.kind === "boolean") {
-            control = '<select id="' + id + '" data-setting="' + h.escapeHtml(entry.key) + '">' +
+            control = '<select id="' + id + '" data-setting="' + h.escapeHtml(entry.key) + '">' + unset +
                 '<option value="true"' + (value === true ? " selected" : "") + '>Yes</option>' +
                 '<option value="false"' + (value === false ? " selected" : "") + '>No</option></select>';
         } else if (entry.kind === "choice") {
-            control = '<select id="' + id + '" data-setting="' + h.escapeHtml(entry.key) + '">' +
+            control = '<select id="' + id + '" data-setting="' + h.escapeHtml(entry.key) + '">' + unset +
                 (entry.choices || []).map(function (choice) {
                     return '<option value="' + h.escapeHtml(choice) + '"' +
                         (String(value) === choice ? " selected" : "") + '>' + h.escapeHtml(choice) + '</option>';
@@ -733,13 +751,18 @@ window.addEventListener("DOMContentLoaded", async function () {
             const control = document.querySelector('[data-setting="' + entry.key + '"]');
             if (!control) return;
             const raw = control.value;
+            // A control left as it was found sends nothing, and that includes
+            // one found with nothing in it. Sending every unset field would
+            // make a Mind missing one text line unable to save any setting at
+            // all — a blank description is refused, and the refusal is the
+            // whole write.
+            if (raw === "") return;
             if (entry.kind === "boolean") {
                 const now = raw === "true";
                 if (!entry.present || entry.value !== now) changed[entry.key] = now;
                 return;
             }
             if (entry.kind === "number") {
-                if (raw === "") return;
                 const now = Number(raw);
                 if (!entry.present || Number(entry.value) !== now) changed[entry.key] = now;
                 return;
