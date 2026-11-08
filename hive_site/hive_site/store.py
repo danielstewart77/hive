@@ -163,7 +163,17 @@ def sqlite_path() -> Path:
             f"set {DSN_VAR} to put it on Postgres. Guessing a path here "
             "would create an empty database somewhere nothing is mounted "
             "and then serve from it.")
-    return Path(named)
+    path = Path(named)
+    if not path.is_absolute():
+        # Resolved against whatever directory the process happens to be in,
+        # on every connection — so a site started from somewhere else opens
+        # a fresh, empty, healthy-looking store. The same failure as an
+        # unnamed file, arrived at by a relative one.
+        raise RuntimeError(
+            f"{PATH_VAR}={named!r} is relative. Name the file absolutely; a "
+            "relative path opens a different database depending on the "
+            "directory the process was started from.")
+    return path
 
 
 def lucent_path() -> str:
@@ -436,11 +446,11 @@ def _unopened() -> RuntimeError:
     """
     if _was_open:
         return RuntimeError(
-            "the console's store is closed. The lifespan shut it down, so "
+            "this site's store is closed. The lifespan shut it down, so "
             "this is work that outlived the application rather than a route "
             "reaching a database too early.")
     return RuntimeError(
-        "the console's store was never opened. The application's lifespan "
+        "this site's store was never opened. The application's lifespan "
         "opens it; a caller reaching a database before that is a route "
         "running outside the app.")
 
@@ -646,7 +656,7 @@ class transaction:
     async def __aenter__(self) -> None:
         if _unit.get() is not None:
             raise RuntimeError(
-                "the console's store does not nest transactions. SQLite has "
+                "this site's store does not nest transactions. SQLite has "
                 "no savepoint here and the inner block would commit the "
                 "outer one's work on its way out, so a failure after it "
                 "would roll back nothing. Open one unit at the top of the "

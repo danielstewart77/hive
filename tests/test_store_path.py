@@ -62,3 +62,14 @@ def test_the_named_file_is_the_one_opened(tmp_path, monkeypatch):
         assert named.is_file()
     finally:
         asyncio.run(store.close())
+
+
+def test_a_relative_file_is_refused(monkeypatch):
+    """A relative path opens a different database per working directory."""
+    monkeypatch.setenv(store.PATH_VAR, "data/hive.db")
+    monkeypatch.setenv(store.DSN_VAR, "")
+
+    with pytest.raises(RuntimeError) as refused:
+        store.sqlite_path()
+
+    assert "relative" in str(refused.value)

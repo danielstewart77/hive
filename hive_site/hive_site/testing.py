@@ -98,11 +98,14 @@ async def on_sqlite(sequence: Callable[[], Awaitable[Any]],
         await store.close()
 
 
-async def on_postgres(sequence: Callable[[], Awaitable[Any]]) -> Any:
-    """Run the same sequence against a scratch Postgres database."""
+async def create_scratch_database(prefix: str = "hive_site") -> tuple[str, str]:
+    """A fresh database on the named server with the schemas applied.
+
+    Returns its name and its DSN. Pair with `drop_scratch_database`.
+    """
     import asyncpg
 
-    name = f"hive_data_parity_{uuid.uuid4().hex[:12]}"
+    name = f"{prefix}_{uuid.uuid4().hex[:12]}"
     admin = await asyncpg.connect(ADMIN_DSN)
     try:
         await admin.execute(f'CREATE DATABASE "{name}"')
@@ -110,13 +113,32 @@ async def on_postgres(sequence: Callable[[], Awaitable[Any]]) -> Any:
         await admin.close()
     base, _, _ = ADMIN_DSN.rpartition("/")
     dsn = f"{base}/{name}"
+    target = await asyncpg.connect(dsn)
     try:
-        target = await asyncpg.connect(dsn)
-        try:
-            for schema in schemas():
-                await target.execute(schema)
-        finally:
-            await target.close()
+        for schema in schemas():
+            await target.execute(schema)
+    finally:
+        await target.close()
+    return name, dsn
+
+
+async def drop_scratch_database(name: str) -> None:
+    import asyncpg
+
+    admin = await asyncpg.connect(ADMIN_DSN)
+    try:
+        await admin.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = $1 AND pid <> pg_backend_pid()", name)
+        await admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    finally:
+        await admin.close()
+
+
+async def on_postgres(sequence: Callable[[], Awaitable[Any]]) -> Any:
+    """Run the same sequence against a scratch Postgres database."""
+    name, dsn = await create_scratch_database("hive_data_parity")
+    try:
         os.environ[store.DSN_VAR] = dsn
         await store.open()
         try:
@@ -126,14 +148,7 @@ async def on_postgres(sequence: Callable[[], Awaitable[Any]]) -> Any:
             await store.close()
     finally:
         os.environ[store.DSN_VAR] = ""
-        admin = await asyncpg.connect(ADMIN_DSN)
-        try:
-            await admin.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE datname = $1 AND pid <> pg_backend_pid()", name)
-            await admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
-        finally:
-            await admin.close()
+        await drop_scratch_database(name)
 
 
 def both_halves(sequence: Callable[[], Awaitable[Any]],

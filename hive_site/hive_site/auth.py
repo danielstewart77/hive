@@ -404,6 +404,15 @@ class BuiltinStore:
             int(payload.get("user_id") or 0))
         if row is None or row["disabled_at"] is not None:
             return None
+        # The cookie names a person as well as a number, and the row has to
+        # be that person. Two sites sharing a signing key but pointed at two
+        # stores — which each site's own `HIVE_DATABASE_URL` permits — number
+        # their accounts independently, and an id looked up alone signed a
+        # non-admin in on the other site as whoever held that id there,
+        # admin included.
+        if normalize_username(str(payload.get("username") or "")) != \
+                normalize_username(str(row["username"])):
+            return None
         if int(payload.get("v") or 0) != int(row["session_version"]):
             return None
         return await self._view_of(row)
@@ -1125,4 +1134,10 @@ async def _seed_first_user() -> None:
     password = os.getenv("HIVE_SEED_PASSWORD", "")
     if not username or not password:
         return
-    await create_user(username, password, is_admin=True)
+    try:
+        await create_user(username, password, is_admin=True)
+    except Conflict:
+        # The other site seeded the same empty store between the count above
+        # and this write. The account exists, which is all this was for; a
+        # refusal here would kill the lifespan of whichever site lost.
+        return

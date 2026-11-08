@@ -49,6 +49,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import logging
 import os
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterable
@@ -61,6 +62,8 @@ from starlette.routing import BaseRoute, Match, Mount
 from starlette.websockets import WebSocket
 
 from . import auth
+
+_log = logging.getLogger(__name__)
 
 PUBLIC = "public"
 SELF = "self"
@@ -449,7 +452,13 @@ class AccessMiddleware:
             fresh = dict(scope, state={})
             try:
                 refusal = await self._decide(fresh, rule, params, page=False)
-            except Exception:  # noqa: BLE001 - a failed recheck is not a refusal
+            except Exception as exc:  # noqa: BLE001 - a failed recheck is not a refusal
+                # Kept open, as an unreachable sign-in service keeps it open
+                # (the 503 below): an outage must not cut every live terminal.
+                # But said, because a disabled user's socket stays up for as
+                # long as this goes on.
+                _log.warning("access recheck failed, connection kept open: %s",
+                             exc)
                 refusal = None
             if refusal is None or refusal.status_code == 503:
                 continue
