@@ -48,6 +48,7 @@ import holder_credentials
 import chief_of_staff
 import kanban_data
 import mind_files
+import mind_images
 import mind_mounts
 import mind_runtime
 import mind_skills
@@ -57,6 +58,7 @@ import route_access
 import sentinel_review
 import sso
 import store
+from hive_data import core
 from auth import (
     clear_session_cookie,
     get_current_user_from_request,
@@ -3572,6 +3574,83 @@ async def api_mind_voice_clip_upload(
         "size_bytes": len(data),
         "clips": list_voice_clips(name),
     }
+
+
+# ── a mind's face ──────────────────────────────────────────────────────
+#
+# Keyed by `mind_id` rather than by the short name every other per-mind
+# route uses, and that is deliberate: a name is a display label the registry
+# rewrites on a rename, so a name-keyed picture is one that goes missing the
+# first time a mind is renamed and is inherited by a stranger the first time
+# a name is reused. See `mind_images`.
+
+
+async def _mind_by_id(mind_id: str) -> dict:
+    """The registry row this id names, or a 404.
+
+    Checked before anything touches the filesystem, so an upload for a mind
+    that does not exist is refused rather than leaving a file nothing will
+    ever serve.
+    """
+    for row in await core.list_minds():
+        if row.get("mind_id") == mind_id:
+            return row
+    raise HTTPException(status_code=404, detail=f"No such mind: {mind_id}")
+
+
+@app.get("/api/minds/{mind_id}/image")
+async def api_mind_image(mind_id: str, user: dict = Depends(require_auth)):
+    """This Mind's picture, or the letter it wears until it has one.
+
+    One URL either way. The fallback is generated here rather than drawn by
+    the page because the page is a Cytoscape canvas that can only be handed
+    an image, and because a second implementation of "what if there is no
+    file" is a second thing to get wrong.
+
+    `no-cache` rather than a long life: the URL is fixed per mind, so a
+    browser left to its own heuristics will keep showing a replaced face for
+    hours. The caller also carries a version, so the usual answer here is a
+    304 rather than the bytes.
+    """
+    del user
+    row = await _mind_by_id(mind_id)
+    headers = {"Cache-Control": "no-cache",
+               "X-Content-Type-Options": "nosniff"}
+    stored = mind_images.stored_image(mind_id)
+    if stored is not None:
+        return FileResponse(stored,
+                            media_type=mind_images.content_type(stored),
+                            headers=headers)
+    return Response(
+        content=mind_images.initial_svg(mind_id, row.get("name") or ""),
+        media_type="image/svg+xml", headers=headers)
+
+
+@app.post("/api/minds/{mind_id}/image")
+async def api_mind_image_upload(
+    mind_id: str, file: UploadFile, user: dict = Depends(require_auth)
+):
+    """Set or replace this Mind's picture.
+
+    A replacement, unlike a voice clip: there is only ever one picture and
+    Daniel's requirement is that he uploads or replaces it. What the file
+    actually is comes from its own bytes — the browser's content type is
+    caller-supplied and decides nothing.
+    """
+    row = await _mind_by_id(mind_id)
+    data = await file.read()
+    try:
+        target = await run_in_threadpool(mind_images.save_image, mind_id, data)
+    except mind_images.ImageRefused as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    log_event(
+        log, "mind.image.uploaded", **_actor_fields(user),
+        mind_id=mind_id, mind_name=row.get("name") or "",
+        size_bytes=len(data), path=str(target),
+    )
+    return {"ok": True, "mind_id": mind_id,
+            "image_version": mind_images.image_version(mind_id),
+            "size_bytes": len(data)}
 
 
 @app.get("/api/minds/{name}/skills")

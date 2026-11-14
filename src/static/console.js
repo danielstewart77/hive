@@ -107,10 +107,29 @@
     const app = document.querySelector("[data-console-app]");
     if (app) {
         document.querySelectorAll("[data-sidebar-open]").forEach(function (button) {
-            button.addEventListener("click", function () { app.classList.add("sidebar-open"); });
+            button.addEventListener("click", function () {
+                app.classList.add("sidebar-open");
+                /* The nav pushes the page aside, and a page carrying its own
+                   push panel (the Chief of Staff done barrel) would then have
+                   two of them open at once — on a 375px phone that leaves the
+                   content no width at all. The nav wins and the page's panel
+                   closes, which is also what a reader reaching for navigation
+                   means. */
+                document.querySelectorAll("[data-push-panel]").forEach(function (panel) {
+                    panel.classList.remove(panel.dataset.pushPanel);
+                });
+            });
         });
         document.querySelectorAll("[data-sidebar-close]").forEach(function (button) {
             button.addEventListener("click", function () { app.classList.remove("sidebar-open"); });
+        });
+        /* `sidebar-open` is a mobile state and nothing was dropping it on the
+           way back to desktop, so a large phone or tablet rotated past 820px
+           and back reopened a nav nobody asked for — and on desktop the class
+           pushed the page aside with the rail already in the layout. */
+        const wide = window.matchMedia("(min-width: 821px)");
+        wide.addEventListener("change", function (event) {
+            if (event.matches) app.classList.remove("sidebar-open");
         });
     }
 
