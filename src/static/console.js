@@ -115,9 +115,7 @@
                    content no width at all. The nav wins and the page's panel
                    closes, which is also what a reader reaching for navigation
                    means. */
-                document.querySelectorAll("[data-push-panel]").forEach(function (panel) {
-                    panel.classList.remove(panel.dataset.pushPanel);
-                });
+                document.dispatchEvent(new CustomEvent("hive:close-push-panels"));
             });
         });
         document.querySelectorAll("[data-sidebar-close]").forEach(function (button) {
@@ -128,9 +126,15 @@
            and back reopened a nav nobody asked for — and on desktop the class
            pushed the page aside with the rail already in the layout. */
         const wide = window.matchMedia("(min-width: 821px)");
-        wide.addEventListener("change", function (event) {
+        const onWide = function (event) {
             if (event.matches) app.classList.remove("sidebar-open");
-        });
+        };
+        /* Safari before 14 has no addEventListener on a MediaQueryList, and
+           an unguarded throw here is inside this file's one IIFE — every
+           binding below it, the nav flyouts, whole-row navigation and the
+           copy buttons, would never be installed, site-wide, silently. */
+        if (wide.addEventListener) wide.addEventListener("change", onWide);
+        else if (wide.addListener) wide.addListener(onWide);
     }
 
     document.querySelectorAll("[data-nav-flyout-toggle]").forEach(function (button) {

@@ -989,9 +989,22 @@ window.addEventListener("DOMContentLoaded", async function () {
     // distinguishes the two.
     function renderImage(mindId, mindName) {
         const section = document.getElementById("mind-image");
-        if (!mindId) return;
-        section.dataset.mindId = mindId;
         section.hidden = false;
+        if (!mindId) {
+            // The registry reported this Mind without an id, which the
+            // Overview above renders as "Not reported". The picture is keyed
+            // by that id, so there is nothing to upload against — said out
+            // loud, because a section that simply did not appear is one
+            // Daniel would read as the feature being missing.
+            document.getElementById("mind-image-summary").innerHTML =
+                '<div class="detail-item"><dt>Picture</dt><dd>Cannot be set: ' +
+                'this Mind has no id in the registry, and a picture is keyed ' +
+                'by it. Re-register the Mind and this appears.</dd></div>';
+            section.querySelector("[data-edit-toggle]").hidden = true;
+            return;
+        }
+        section.dataset.mindId = mindId;
+        section.querySelector("[data-edit-toggle]").hidden = false;
         const url = "/api/minds/" + encodeURIComponent(mindId) + "/image?v=" + Date.now();
         document.getElementById("mind-image-summary").innerHTML =
             '<div class="detail-item"><dt>Picture</dt><dd>' +

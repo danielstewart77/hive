@@ -373,6 +373,10 @@ a { color: inherit; }
        dimmed overlay stays — it is what closing by tapping beside the nav
        is, and a push with no way back is a trap on a phone. */
     .console-app.sidebar-open .console-main { transform: translateX(var(--console-sidebar-width)); }
+    /* The push would otherwise give the document 232px of horizontal scroll:
+       scroll right, close the nav, and the page is left looking blank until
+       you scroll back. */
+    .console-app.sidebar-open { overflow-x: hidden; }
     .console-mobile-header { height: 55px; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; border-bottom: 1px solid var(--console-line); background: #101316; }
     .mobile-brand { display: inline-flex; align-items: center; gap: 8px; color: var(--console-text); text-decoration: none; font-weight: 700; }
     .mobile-brand img { width: 23px; height: 23px; }

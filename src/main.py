@@ -6,6 +6,7 @@ self-contained; the auth db and secret are shared with the terminal site.
 
 import asyncio
 import base64
+import hashlib
 import ipaddress
 import json
 import logging
@@ -3585,6 +3586,22 @@ async def api_mind_voice_clip_upload(
 # a name is reused. See `mind_images`.
 
 
+#: One in-flight upload per mind. A double-click on "Upload picture" is two
+#: concurrent calls, and without this they interleave: both stage, both
+#: rename, and the file on disk can be a hybrid of two photos that neither
+#: request has any way to notice — both answered `{"ok": true}`. The console
+#: runs a single worker, so a lock in the process is the whole boundary.
+_IMAGE_WRITE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _image_lock(mind_id: str) -> asyncio.Lock:
+    lock = _IMAGE_WRITE_LOCKS.get(mind_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _IMAGE_WRITE_LOCKS[mind_id] = lock
+    return lock
+
+
 async def _mind_by_id(mind_id: str) -> dict:
     """The registry row this id names, or a 404.
 
@@ -3599,7 +3616,8 @@ async def _mind_by_id(mind_id: str) -> dict:
 
 
 @app.get("/api/minds/{mind_id}/image")
-async def api_mind_image(mind_id: str, user: dict = Depends(require_auth)):
+async def api_mind_image(mind_id: str, v: str = "",
+                         user: dict = Depends(require_auth)):
     """This Mind's picture, or the letter it wears until it has one.
 
     One URL either way. The fallback is generated here rather than drawn by
@@ -3614,16 +3632,30 @@ async def api_mind_image(mind_id: str, user: dict = Depends(require_auth)):
     """
     del user
     row = await _mind_by_id(mind_id)
-    headers = {"Cache-Control": "no-cache",
-               "X-Content-Type-Options": "nosniff"}
+    # A caller that named a version gets a long life, because the version is
+    # part of the URL and a replacement changes it — so there is nothing to
+    # go stale. A caller that named none must revalidate, because its URL
+    # would otherwise serve a replaced picture for as long as the browser
+    # felt like it. `FileResponse` answers no conditional request of its own,
+    # so "revalidate" here really does mean the whole body again; that is the
+    # price of not naming a version, and the chart always names one.
+    headers = {
+        "Cache-Control": ("public, max-age=31536000, immutable" if v
+                          else "no-cache"),
+        "X-Content-Type-Options": "nosniff",
+    }
     stored = mind_images.stored_image(mind_id)
     if stored is not None:
         return FileResponse(stored,
                             media_type=mind_images.content_type(stored),
                             headers=headers)
-    return Response(
-        content=mind_images.initial_svg(mind_id, row.get("name") or ""),
-        media_type="image/svg+xml", headers=headers)
+    letter = mind_images.initial_svg(mind_id, row.get("name") or "")
+    # An ETag so a revalidation can be answered 304 instead of re-sending the
+    # body and re-reading the registry. This branch is the common one: a mind
+    # with no picture is every mind's starting state.
+    headers["ETag"] = '"%s"' % hashlib.sha256(letter).hexdigest()[:32]
+    return Response(content=letter, media_type="image/svg+xml",
+                    headers=headers)
 
 
 @app.post("/api/minds/{mind_id}/image")
@@ -3639,18 +3671,24 @@ async def api_mind_image_upload(
     """
     row = await _mind_by_id(mind_id)
     data = await file.read()
-    try:
-        target = await run_in_threadpool(mind_images.save_image, mind_id, data)
-    except mind_images.ImageRefused as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # The write and the version read are one operation. Reading the version
+    # afterwards, outside the lock, is how a second upload's reply reports
+    # the first upload's file — the page then says "Saved" and shows a
+    # different picture than the one just chosen.
+    async with _image_lock(mind_id):
+        try:
+            target = await run_in_threadpool(
+                mind_images.save_image, mind_id, data)
+        except mind_images.ImageRefused as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        version = mind_images.image_version(mind_id)
     log_event(
         log, "mind.image.uploaded", **_actor_fields(user),
         mind_id=mind_id, mind_name=row.get("name") or "",
         size_bytes=len(data), path=str(target),
     )
     return {"ok": True, "mind_id": mind_id,
-            "image_version": mind_images.image_version(mind_id),
-            "size_bytes": len(data)}
+            "image_version": version, "size_bytes": len(data)}
 
 
 @app.get("/api/minds/{name}/skills")

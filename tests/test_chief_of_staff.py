@@ -649,3 +649,46 @@ async def test_a_chief_who_is_not_a_registered_mind_carries_no_face():
     tree = await cos.get_tree(chief="Nobody", now=NOW)
 
     assert "minds" not in _by_id(tree, cos.CHIEF_ID)
+
+
+async def test_a_card_names_the_mind_that_has_the_work_now():
+    """Work handed from one mind to another draws the mind that has it.
+
+    The pairing table is ordered by when a session was attached, so drawing
+    the first of it showed whoever *started* the work — a card stating the
+    wrong owner, with no mark to say it was one of several, for as long as
+    the original session row survived. "Who has it" is one of the three
+    things a card exists to say.
+    """
+    first = await _mind("Cypher")
+    second = await _mind("Nagatha")
+    started = await _named_session(first, "sess-first", "First pass")
+    took_over = await _named_session(second, "sess-second", "Second pass")
+    await core.update_session(started, last_active=NOW - 3600)
+    await core.update_session(took_over, last_active=NOW)
+
+    task = await _task()
+    await staff.attach_session(task["id"], started, now=NOW - 3600)
+    await staff.attach_session(task["id"], took_over, now=NOW)
+
+    tree = await cos.get_tree(now=NOW)
+
+    node = _by_id(tree, task["id"])
+    assert [m["name"] for m in node["minds"]] == ["Nagatha", "Cypher"]
+    assert node["session_names"][0] == "Second pass"
+
+
+async def test_a_session_whose_clock_runs_ahead_does_not_spin_forever():
+    """A `last_active` in the future would otherwise read as fresh for as
+    long as the drift lasted, leaving the watch's record as the only thing
+    holding the spinner back — which is the one condition that was never
+    enough on its own."""
+    mind = await _mind("Cypher")
+    session = await _named_session(mind, "sess-ahead", "Ahead")
+    await core.update_session(session, last_active=NOW + 48 * 3600)
+    task = await _task()
+    await staff.attach_session(task["id"], session, now=NOW)
+
+    tree = await cos.get_tree(now=NOW)
+
+    assert _by_id(tree, task["id"])["active"] is False

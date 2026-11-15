@@ -35,6 +35,8 @@ from __future__ import annotations
 import os
 import re
 import struct
+import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -138,11 +140,18 @@ def _jpeg_size(data: bytes) -> tuple[int, int] | None:
     # it, and a phone photo carries all three.
     index = 2
     end = len(data)
-    while index + 9 < end:
+    while index + 9 <= end:
         if data[index] != 0xFF:
             index += 1
             continue
         marker = data[index + 1]
+        # `0xFF` before a marker is legal fill and several encoders emit it.
+        # Read as a marker it takes the next two bytes for a length, the walk
+        # jumps past the frame header, and a photo every other tool opens is
+        # refused as unmeasurable.
+        if marker == 0xFF:
+            index += 1
+            continue
         if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
             index += 2
             continue
@@ -215,11 +224,23 @@ def stored_image(mind_id: str) -> Path | None:
     if not valid_mind_id(mind_id):
         return None
     directory = _mind_dir()
+    found = []
     for extension in _TYPES:
         candidate = directory / f"{mind_id}.{extension}"
-        if candidate.is_file():
-            return candidate
-    return None
+        try:
+            found.append((candidate.stat().st_mtime_ns, candidate))
+        except OSError:
+            continue
+    if not found:
+        return None
+    # Newest, not first by extension. Two files for one mind is supposed to
+    # be impossible, but the cleanup that guarantees it can fail — a dead
+    # process, a read-only mount — and picking by declaration order would
+    # then serve the *replaced* picture for good, with a version that never
+    # changes, so nothing on the page could ever notice. Newest-wins makes
+    # that failure invisible instead of permanent.
+    found.sort()
+    return found[-1][1]
 
 
 def image_version(mind_id: str) -> int:
@@ -231,7 +252,17 @@ def image_version(mind_id: str) -> int:
     with nothing on the page to say so.
     """
     path = stored_image(mind_id)
-    return 0 if path is None else path.stat().st_mtime_ns
+    if path is None:
+        return 0
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        # The file went between the listing and the stat — a replacement in
+        # another format removes the old one, and that is a real window. This
+        # is called once per mind per task while building the whole tree, so
+        # an exception here fails the entire page rather than one corner of
+        # one card. No version reads the same as no picture.
+        return 0
 
 
 def save_image(mind_id: str, data: bytes) -> Path:
@@ -259,17 +290,22 @@ def save_image(mind_id: str, data: bytes) -> Path:
     directory = _mind_dir()
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / f"{mind_id}.{kind}"
-    staging = directory / f".{mind_id}.incoming"
+    staging = directory / f".{mind_id}.{os.getpid()}.{uuid.uuid4().hex}.incoming"
     try:
         staging.write_bytes(data)
         os.replace(staging, target)
     except BaseException:
         staging.unlink(missing_ok=True)
         raise
+    # After the rename, and deliberately not inside its try: the new picture
+    # is already in place and is the one that counts. A failure to remove the
+    # old one is untidy, not a failed upload, and `stored_image` picks the
+    # newest so the reader still sees what was just uploaded.
     for extension in _TYPES:
         if extension == kind:
             continue
-        directory.joinpath(f"{mind_id}.{extension}").unlink(missing_ok=True)
+        with suppress(OSError):
+            directory.joinpath(f"{mind_id}.{extension}").unlink(missing_ok=True)
     return target
 
 
@@ -299,7 +335,12 @@ def initial_of(name: str) -> str:
     overlooked, because it is his word for it and the letter is temporary by
     construction - it is what a mind shows only until it has a face.
     """
-    stripped = str(name or "").strip()
+    stripped = "".join(
+        c for c in str(name or "") if c.isprintable()).strip()
+    # A control character, a combining mark or a bidi override is not a
+    # letter anyone can read: one of them as the whole glyph draws an empty
+    # badge, or in the case of U+0000 an SVG that is not well-formed and
+    # draws nothing at all, which reads as the chart being broken.
     return stripped[0].upper() if stripped else "?"
 
 
@@ -307,8 +348,10 @@ def initial_svg(mind_id: str, name: str) -> bytes:
     """The generated stand-in: one letter, on a colour this mind keeps.
 
     The letter is escaped. `core.minds.name` is unconstrained text, and a
-    name carrying a quote or an angle bracket would otherwise close the
-    attribute it is written into.
+    name carrying an angle bracket would otherwise open a tag inside the
+    document this is served as. It lands in element content rather than in an
+    attribute — worth being exact about, because the next person deciding
+    what else may go into this template will read this sentence first.
     """
     letter = _escape(initial_of(name))
     seed = sum(str(mind_id or "").encode()) if mind_id else 0

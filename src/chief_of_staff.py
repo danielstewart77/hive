@@ -79,11 +79,14 @@ AGENT_TIMEOUT = 15 * 60
 #: from spinning every card in the tree indefinitely.
 LIVE_WITHIN = AGENT_TIMEOUT
 
-#: The longest session name a card draws. A card is 170 pixels wide and the
-#: column is unconstrained text; a five-hundred-character name would be the
-#: whole chart. Truncated rather than dropped - a long name is still the
-#: answer to "which session", just not all of it.
-NAME_LIMIT = 40
+#: The longest session name a card draws. Derived from the card rather than
+#: picked: a node is 174 pixels wide with a 116-pixel text column at 11px, so
+#: a line holds roughly twenty characters, and the name sits under a task
+#: name that already wraps to two. Forty characters was three more wrapped
+#: lines than a 62-pixel card has room for, which pushed the label out over
+#: the kind icon and the face. Truncated rather than dropped - a long name is
+#: still the answer to "which session", just not all of it.
+NAME_LIMIT = 24
 
 #: The chief of staff's node. One root, named rather than derived: the page
 #: is about this mind and a hive with no ledger rows still draws him.
@@ -131,19 +134,36 @@ async def _assigned(session_ids: list[str], names: dict[str, str],
     `alive`: an ended conversation leaves no row, but a *surviving* row that
     has been silent for hours is the ordinary state of most of this table.
     """
-    minds: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    session_names: list[str] = []
     alive = False
     fresh = False
+    rows: list[dict[str, Any]] = []
     for session_id in session_ids:
         row = await core.get_session(session_id)
         if row is None:
             continue
         alive = True
-        last_active = row.get("last_active")
-        if last_active is not None and now - float(last_active) <= LIVE_WITHIN:
+        age = now - float(row["last_active"])
+        # Bounded at both ends. A `last_active` in the future - a host whose
+        # clock runs ahead - would otherwise read as fresh for as long as the
+        # drift lasts, which quietly reduces the two conditions this module
+        # is built around back to the one that was not enough.
+        if -LIVE_WITHIN <= age <= LIVE_WITHIN:
             fresh = True
+        rows.append(row)
+
+    # Most recently active first. The pairing table is ordered by when a
+    # session was attached, and taking the first of that draws whoever
+    # started the work rather than whoever has it: a task handed from one
+    # mind to another went on showing the first mind's face and the first
+    # mind's session name for as long as that session row survived, stating
+    # the wrong owner with complete confidence. "Who has it" is one of the
+    # three things a card exists to say, and a hand-off is how work moves.
+    rows.sort(key=lambda r: float(r["last_active"]), reverse=True)
+
+    minds: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    session_names: list[str] = []
+    for row in rows:
         mind_id = row.get("mind_id") or ""
         name = names.get(mind_id)
         if name and mind_id not in seen:
@@ -337,9 +357,15 @@ async def get_tree(*, chief: str = "Stash",
     tasks = await staff.tasks()
     mind_rows = await core.list_minds()
     names = _mind_names(mind_rows)
-    epics = await kanban_data.list_epics()
-    features = await kanban_data.list_features()
-    stories = await kanban_data.list_stories()
+    # One read of the board rather than three. `get_data`'s own docstring
+    # says why: three reads are three moments, and a feature created between
+    # two of them is absent from the kind lookup, so a task naming it would
+    # draw as a plain task with no children — indistinguishable from a task
+    # naming no board item at all.
+    board = await kanban_data.get_data()
+    epics = board["epics"]
+    features = board["features"]
+    stories = board["stories"]
     numbers = await kanban_data.backlog_numbers()
     kinds = _work_kinds(epics, features, stories)
     agent_rows = await staff.agents()
