@@ -386,14 +386,25 @@ async def test_a_task_naming_no_board_item_is_drawn_as_a_task():
 async def test_a_task_naming_a_board_item_that_is_gone_is_drawn_as_a_task():
     """Migration 0009 says a dangling board item draws as a plain task. The
     page used to treat anything that was not a feature as an epic, so a
-    deleted row claimed to be one."""
+    deleted row claimed to be one and dragged a stranger's features under it.
+
+    The board is seeded first and deliberately: against an empty board a
+    mis-drawn epic has nothing to draw, so the assertion would hold for a
+    page that had the bug.
+    """
+    epic = await kanban_data.create_epic("Chief of Staff")
+    feature = await kanban_data.create_feature(epic["id"], "Visualization")
+    await kanban_data.create_story("The page", feature_id=feature["id"])
     task = await _task(board_item="w-no-such-item")
 
     tree = await cos.get_tree(now=NOW)
 
     node = _by_id(tree, task["id"])
     assert node["work_kind"] == cos.TASK_KIND
+    # Nothing hangs off it: the dead id is not somebody else's epic.
     assert _ids(tree["nodes"], "feature") == []
+    assert _ids(tree["nodes"], "story") == []
+    assert [e for e in tree["edges"] if e["source"] == task["id"]] == []
 
 
 async def test_a_story_drawn_under_its_feature_says_it_is_a_story():
@@ -453,32 +464,38 @@ async def test_a_status_of_in_progress_cannot_by_itself_make_work_active():
     assert node["active"] is False
 
 
-async def test_a_session_silent_longer_than_a_turn_is_not_active():
+async def test_a_session_silent_for_twenty_minutes_is_not_active():
     """The case the watch cannot report. `stopped_at` is still null — a hung
     turn is one the watch does not notice, and a stopped watch never writes
-    again — so on that record alone this card would spin forever."""
+    again — so on that record alone this card would spin forever.
+
+    Twenty minutes is longer than any turn this hive allows, and it is spelled
+    out rather than read off `cos.LIVE_WITHIN`: a test that computes its clock
+    from the constant moves with it, so a window narrowed to one second would
+    pass while every card stopped spinning a second after its last output.
+    """
     mind = await _mind("Cypher")
     session = await _session(mind)
     task = await _task(status="in progress")
     await staff.attach_session(task["id"], session, now=NOW)
 
-    later = NOW + cos.LIVE_WITHIN + 1
-    tree = await cos.get_tree(now=later)
+    tree = await cos.get_tree(now=NOW + 20 * 60)
 
     node = _by_id(tree, task["id"])
     assert node["activity"] == "working"
     assert node["active"] is False
 
 
-async def test_a_session_silent_within_a_turn_is_still_active():
-    """The other side of the same boundary, so the bound is a bound and not
-    an accident of whichever clock the first test used."""
+async def test_a_session_silent_for_five_minutes_is_still_active():
+    """The other side of the bound, and the half that pins it from below: a
+    turn is routinely quiet for minutes, so five minutes must still read as
+    inside one."""
     mind = await _mind("Cypher")
     session = await _session(mind)
     task = await _task()
     await staff.attach_session(task["id"], session, now=NOW)
 
-    tree = await cos.get_tree(now=NOW + cos.LIVE_WITHIN - 1)
+    tree = await cos.get_tree(now=NOW + 5 * 60)
 
     assert _by_id(tree, task["id"])["active"] is True
 
@@ -543,8 +560,17 @@ async def test_the_session_name_is_on_the_assigned_item_and_not_its_children():
 
     tree = await cos.get_tree(now=NOW)
 
-    assert _by_id(tree, task["id"])["session_names"] == ["Visualization"]
-    assert _by_id(tree, story["id"]).get("session_names", []) == []
+    parent = _by_id(tree, task["id"])
+    child = _by_id(tree, story["id"])
+    assert parent["session_names"] == ["Visualization"]
+    assert child.get("session_names", []) == []
+    # The same rule, for the other two things an assignment carries. A story
+    # drawn under an assigned feature is not itself assigned to anybody, so it
+    # inherits neither the mind's face nor the spinner.
+    assert parent["minds"] != []
+    assert child.get("minds", []) == []
+    assert parent["active"] is True
+    assert child["active"] is False
 
 
 async def test_a_session_with_no_name_contributes_no_name():
@@ -562,15 +588,19 @@ async def test_a_session_with_no_name_contributes_no_name():
 
 
 async def test_a_session_name_is_cut_to_what_a_card_can_hold():
+    """Spelled out rather than read off `cos.NAME_LIMIT`, which a cap of 500
+    would otherwise satisfy. A card is 174 pixels wide; 80 characters is
+    already more than it can draw."""
     mind = await _mind("Cypher")
-    session = await _named_session(mind, name="x" * (cos.NAME_LIMIT + 40))
+    session = await _named_session(mind, name="x" * 300)
     task = await _task()
     await staff.attach_session(task["id"], session, now=NOW)
 
     tree = await cos.get_tree(now=NOW)
 
-    assert _by_id(tree, task["id"])["session_names"] == [
-        "x" * cos.NAME_LIMIT]
+    kept = _by_id(tree, task["id"])["session_names"][0]
+    assert kept == "x" * cos.NAME_LIMIT
+    assert len(kept) <= 80
 
 
 # ------------------------------------------------------------- the chief's own
@@ -580,7 +610,32 @@ async def test_a_session_name_is_cut_to_what_a_card_can_hold():
 # registry row, so it is resolved by name.
 
 
+async def test_an_assigned_card_carries_what_the_page_fetches_its_face_with():
+    """Daniel's first protection, on the card rather than on the route. The
+    page builds `/api/minds/<mind_id>/image?v=<version>`, so a card carrying
+    only a name and a letter is a card no picture ever reaches — and the
+    version is the whole reason the card computes anything, because one fixed
+    URL per mind is one a browser is entitled to keep serving stale.
+    """
+    mind = await _mind("Cypher")
+    session = await _session(mind)
+    task = await _task()
+    await staff.attach_session(task["id"], session, now=NOW)
+
+    tree = await cos.get_tree(now=NOW)
+
+    face = _by_id(tree, task["id"])["minds"][0]
+    assert face["mind_id"] == mind
+    assert "image_version" in face
+
+
 async def test_the_root_carries_the_chief_s_own_face():
+    """A second mind is registered on purpose: with one row in the registry
+    this passes for a lookup that returns whichever mind came first, and on a
+    real hive the root would wear a stranger's face. `_mind` names them so
+    that "Ada" sorts ahead of "stash", which is the order `list_minds` uses.
+    """
+    await _mind("Ada")
     await _mind("stash")
 
     tree = await cos.get_tree(chief="Stash", now=NOW)

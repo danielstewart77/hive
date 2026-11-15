@@ -41,6 +41,28 @@ def _png(width: int = 8, height: int = 8) -> bytes:
             + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
 
+def _jpeg(width: int = 8, height: int = 8) -> bytes:
+    """A JPEG whose frame header says this size.
+
+    Hand-built because `_jpeg_size` walks the segment chain rather than
+    reading a fixed offset, and that walk is the thing under test.
+    """
+    sof = (b"\xff\xc0" + struct.pack(">H", 17) + b"\x08"
+           + struct.pack(">HH", height, width) + b"\x03"
+           + b"\x01\x11\x00\x02\x11\x01\x03\x11\x01")
+    return b"\xff\xd8" + sof + b"\xff\xd9"
+
+
+def _webp(width: int = 8, height: int = 8) -> bytes:
+    """An extended-format WEBP whose canvas is this size. The stored size is
+    one less than the real one, which is exactly the sort of detail a parser
+    gets wrong silently."""
+    body = (b"WEBP" + b"VP8X" + struct.pack("<I", 10) + b"\x00\x00\x00\x00"
+            + (width - 1).to_bytes(3, "little")
+            + (height - 1).to_bytes(3, "little"))
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
 @pytest.fixture(autouse=True)
 def _image_dir(tmp_path, monkeypatch):
     """The store, pointed at a scratch directory.
@@ -94,13 +116,24 @@ def test_a_mind_with_a_picture_is_served_that_picture(signed_in, registered):
 def test_a_replacement_changes_the_version_the_card_asks_for(signed_in,
                                                              registered):
     """One URL per mind is a URL a browser may keep, so the version is what
-    makes a replaced face actually appear."""
+    makes a replaced face actually appear.
+
+    It replaces, rather than uploading once and checking the number is not
+    zero: "a file exists" would satisfy a version that was any constant, and
+    a constant is precisely the bug this guards.
+    """
     assert mind_images.image_version(registered) == 0
 
     signed_in.post(f"/api/minds/{registered}/image",
-                   files={"file": ("face.png", _png(), "image/png")})
+                   files={"file": ("face.png", _png(8, 8), "image/png")})
+    first = mind_images.image_version(registered)
 
-    assert mind_images.image_version(registered) != 0
+    signed_in.post(f"/api/minds/{registered}/image",
+                   files={"file": ("face.png", _png(16, 16), "image/png")})
+    second = mind_images.image_version(registered)
+
+    assert first != 0
+    assert second != first
 
 
 def test_replacing_a_png_with_a_gif_leaves_one_picture_not_two(signed_in,
@@ -150,7 +183,8 @@ def test_a_name_carrying_markup_cannot_escape_the_generated_letter():
     an SVG that is served to a browser."""
     svg = mind_images.initial_svg(MIND_ID, '"><script>alert(1)</script>')
 
-    assert b"<script" not in svg
+    # The quote is what matters: the letter is written into an attribute, and
+    # one character can never spell "<script" however badly it is handled.
     assert b"&quot;" in svg
 
 
@@ -192,6 +226,67 @@ def test_an_image_too_many_pixels_a_side_is_refused(signed_in, registered):
     refused = signed_in.post(
         f"/api/minds/{registered}/image",
         files={"file": ("big.png", oversized, "image/png")})
+
+    assert refused.status_code == 400
+    assert mind_images.stored_image(registered) is None
+
+
+@pytest.mark.parametrize("name,build", [
+    ("big.jpg", _jpeg),
+    ("big.webp", _webp),
+])
+def test_the_pixel_cap_holds_for_every_format_not_just_png(signed_in,
+                                                           registered,
+                                                           name, build):
+    """Each format stores its size differently and each has its own parser, so
+    a cap proved against a PNG says nothing about the other three."""
+    refused = signed_in.post(
+        f"/api/minds/{registered}/image",
+        files={"file": (name, build(mind_images.MAX_PIXELS + 1, 4),
+                        "image/png")})
+
+    assert refused.status_code == 400
+    assert mind_images.stored_image(registered) is None
+
+
+@pytest.mark.parametrize("name,good", [
+    ("face.jpg", _jpeg), ("face.webp", _webp),
+])
+def test_an_ordinary_picture_in_every_format_is_accepted(signed_in, registered,
+                                                         name, good):
+    """The other side of the cap: a parser that read nothing would refuse
+    everything, and a refusal-only test cannot tell that from working."""
+    stored = signed_in.post(f"/api/minds/{registered}/image",
+                            files={"file": (name, good(64, 48), "image/png")})
+
+    assert stored.status_code == 200, stored.text
+    assert mind_images.stored_image(registered) is not None
+
+
+def test_a_picture_whose_header_cannot_be_measured_is_refused(signed_in,
+                                                              registered):
+    """The module's loudest rule: "I could not measure it" must never resolve
+    to "it is fine". A PNG signature with no IHDR behind it is unmeasurable,
+    and storing it unbounded is the failure."""
+    headerless = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+    refused = signed_in.post(
+        f"/api/minds/{registered}/image",
+        files={"file": ("broken.png", headerless, "image/png")})
+
+    assert refused.status_code == 400
+    assert mind_images.stored_image(registered) is None
+
+
+def test_a_picture_over_the_byte_cap_is_refused(signed_in, registered):
+    """Three megabytes, spelled out. Reading the cap off the module would
+    build a payload that grew with it, so raising the cap would make this
+    test raise its own bar and pass — which is the bug, not the guard."""
+    oversized = _png() + b"\x00" * (3 * 1024 * 1024)
+
+    refused = signed_in.post(
+        f"/api/minds/{registered}/image",
+        files={"file": ("huge.png", oversized, "image/png")})
 
     assert refused.status_code == 400
     assert mind_images.stored_image(registered) is None
