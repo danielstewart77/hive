@@ -18,6 +18,7 @@ def test_description_renderer_draws_valid_diagram_and_reports_invalid_source():
         }''')
         body = page.locator('#description')
         assert body.locator('.md-diagram svg').count() == 1
+        assert body.locator('.md-diagram svg').is_visible()
         assert 'Start' in body.locator('.md-diagram').inner_text()
         assert 'End' in body.locator('.md-diagram').inner_text()
         assert 'could not be drawn' in body.locator('.md-diagram-notice').inner_text()
