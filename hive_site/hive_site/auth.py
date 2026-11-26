@@ -1017,6 +1017,40 @@ def request_is_https(request: HTTPConnection) -> bool:
     return request.url.scheme == "https"
 
 
+def _browser_host(request: HTTPConnection) -> str:
+    """The host name the browser asked for, lower case and without a port.
+
+    A reverse proxy that rewrites Host says what the browser used in
+    `X-Forwarded-Host`, so that header decides when it is present, as
+    `X-Forwarded-Proto` does for the scheme.
+    """
+    raw = request.headers.get("x-forwarded-host", "") or request.headers.get("host", "")
+    host = raw.split(",")[0].strip().lower()
+    if host.startswith("["):  # an IPv6 literal, `[::1]:8710`
+        return host[1:].split("]")[0]
+    return host.rsplit(":", 1)[0].rstrip(".") if ":" in host else host.rstrip(".")
+
+
+def _cookie_domain_for(request: HTTPConnection) -> str:
+    """The parent domain to set the cookie on, or empty for host-only.
+
+    The parent domain is how the terminal site shares this session, and it
+    only means anything to a browser that is at an address inside it: a
+    cookie whose Domain does not cover the host it came from is dropped
+    without a word. Until 2026-11-26 it was stamped on every answer, so a
+    sign-in at localhost or the machine's IP address was accepted and then
+    looped back to the login page. Anywhere outside the domain the cookie is
+    host-only.
+    """
+    domain = _cookie_domain().strip().lower().strip(".")
+    if not domain:
+        return ""
+    host = _browser_host(request)
+    if host == domain or host.endswith("." + domain):
+        return domain
+    return ""
+
+
 def _cookie_kwargs(request: HTTPConnection) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "max_age": SESSION_MAX_AGE,
@@ -1024,14 +1058,15 @@ def _cookie_kwargs(request: HTTPConnection) -> dict[str, Any]:
         "samesite": "lax",
         "secure": request_is_https(request),
     }
-    domain = _cookie_domain()
+    domain = _cookie_domain_for(request)
     if domain:
         kwargs["domain"] = domain
     return kwargs
 
 
-def _delete_cookie(response, name: str) -> None:
-    domain = _cookie_domain()
+def _delete_cookie(request: HTTPConnection, response, name: str) -> None:
+    """Remove a cookie where a sign-in at this address would have set it."""
+    domain = _cookie_domain_for(request)
     if domain:
         response.delete_cookie(name, domain=domain)
     else:
@@ -1041,20 +1076,20 @@ def _delete_cookie(response, name: str) -> None:
 def set_session_cookie(request: HTTPConnection, response, token: str) -> None:
     """A password session; any Microsoft or Windows session is ended, so the
     browser holds exactly one identity."""
-    _delete_cookie(response, SSO_COOKIE_NAME)
+    _delete_cookie(request, response, SSO_COOKIE_NAME)
     response.set_cookie(get_store().cookie_name, token,
                         **_cookie_kwargs(request))
 
 
 def set_sso_cookie(request: HTTPConnection, response, token: str) -> None:
     """A Microsoft or Windows session; any password session is ended."""
-    _delete_cookie(response, get_store().cookie_name)
+    _delete_cookie(request, response, get_store().cookie_name)
     response.set_cookie(SSO_COOKIE_NAME, token, **_cookie_kwargs(request))
 
 
-def clear_session_cookie(response) -> None:
-    _delete_cookie(response, get_store().cookie_name)
-    _delete_cookie(response, SSO_COOKIE_NAME)
+def clear_session_cookie(request: HTTPConnection, response) -> None:
+    _delete_cookie(request, response, get_store().cookie_name)
+    _delete_cookie(request, response, SSO_COOKIE_NAME)
 
 
 # ── built-in helpers for seeding, tooling and tests ─────────────────────

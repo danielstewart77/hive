@@ -583,7 +583,7 @@ async def logout(request: Request):
         with suppress(auth.ServiceUnavailable):
             await account_store.sign_out(token)
     response = RedirectResponse(url="/login", status_code=303)
-    clear_session_cookie(response)
+    clear_session_cookie(request, response)
     log_event(log, "auth.logout", **_actor_fields(user))
     return response
 
