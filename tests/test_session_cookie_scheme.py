@@ -71,6 +71,7 @@ def test_a_sign_in_inside_the_cookie_domain_gets_a_cookie_on_that_domain(
 ):
     monkeypatch.setenv("HIVE_COOKIE_DOMAIN", "sparktobloom.com")
 
-    for address in ("https://hive.sparktobloom.com", "https://sparktobloom.com"):
+    for address in ("https://hive.sparktobloom.com", "https://sparktobloom.com",
+                    "https://hive.sparktobloom.com:8443"):
         _, set_cookie = _sign_in(address)
         assert "domain=sparktobloom.com" in set_cookie.lower(), address
