@@ -2711,7 +2711,20 @@ async def api_chief_of_staff(
     ago than that is left out of the answer (feature 6.11).
     """
     del user
-    return await chief_of_staff.get_tree(window_days=days)
+    # Each mind's own turn, as the gateway sees it: the one thing on this
+    # page the database cannot say. A gateway that does not answer, or an
+    # older one without the route, leaves every card read as it was before.
+    turns: dict[str, dict] = {}
+    try:
+        # Three seconds, so a gateway that hangs costs the page three
+        # seconds and its marks, never the tree.
+        answer = await asyncio.wait_for(
+            _gateway_json("/sessions/turns", admin=True), timeout=3.0)
+        turns = {str(t["session_id"]): t for t in answer.get("turns", [])
+                 if isinstance(t, dict) and t.get("session_id")}
+    except Exception:  # noqa: BLE001 - a view, never the page
+        turns = {}
+    return await chief_of_staff.get_tree(window_days=days, turns=turns)
 
 
 @app.get("/graph/data")
